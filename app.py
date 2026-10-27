@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import tempfile
@@ -14,6 +15,7 @@ from core.tts_engine import (
     TTSEngine,
     render_chapter,
 )
+from core.voice_harvester import harvest_voice_from_youtube, list_harvested_voices
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +25,10 @@ logging.basicConfig(
 logger = logging.getLogger('epub2m4b')
 
 DEFAULT_WORKSPACE = Path(__file__).resolve().parent / 'workspace'
+DEFAULT_VOICES_ROOT = Path(__file__).resolve().parent / 'voices'
+
+# Mutable at runtime so the UI and tests can point at a different collection root.
+VOICES_ROOT = DEFAULT_VOICES_ROOT
 
 
 def _slugify(text: str) -> str:
@@ -85,6 +91,122 @@ def handle_epub_upload(epub_file: str | None, work_root: Path = DEFAULT_WORKSPAC
         gr.update(choices=choices, value=selected),
         md_text,
     )
+
+
+def handle_harvest_voice(
+    voice_id: str,
+    query_or_url: str,
+    target_minutes: float = 6.0,
+    max_videos: int = 1,
+):
+    """Run the auto harvester and return a summary, the golden ref, and table rows.
+
+    Returns ``(summary, golden_ref_wav, golden_ref_text, rows)`` where ``rows``
+    is the Gradio ``Dataframe`` value (one row per harvested voice profile).
+    """
+    voice_id = (voice_id or '').strip()
+    query_or_url = (query_or_url or '').strip()
+    if not voice_id or not query_or_url:
+        return '⚠️ Cần nhập Voice ID và từ khóa/URL YouTube.', None, '', _voice_table_rows()
+
+    logger.info(f'🎙️ [HARVEST_UI] Bắt đầu cào giọng "{voice_id}" từ "{query_or_url}"')
+    try:
+        result = harvest_voice_from_youtube(
+            voice_id=voice_id,
+            query_or_url=query_or_url,
+            voices_root=Path(VOICES_ROOT),
+            target_clean_minutes=float(target_minutes),
+            max_videos=int(max_videos),
+        )
+    except Exception as exc:  # never let a UI action crash the whole Gradio app
+        logger.exception('❌ [HARVEST_UI] Cào giọng thất bại')
+        return f'❌ Cào giọng thất bại: {exc}', None, '', _voice_table_rows()
+
+    profile = _read_voice_profile(result.voice_dir)
+    golden_wav = profile['golden_ref_wav']
+    summary = (
+        f'✅ Đã cào xong "{voice_id}": {len(result.kept_clips)} câu / '
+        f'{result.total_clean_sec / 60.0:.1f} phút sạch. '
+        f'Đã xuất `metadata.csv` (F5-TTS) và `gpt_sovits.list` (GPT-SoVITS).'
+    )
+    logger.info(f'✅ [HARVEST_UI] {summary}')
+    return summary, golden_wav or None, profile['golden_ref_text'], _voice_table_rows()
+
+
+def handle_select_harvested_voice(voice_id: str | None):
+    """Load a harvested profile and auto-populate the F5-TTS reference fields.
+
+    Returns ``(voice_choices_update, summary, golden_ref_wav, golden_ref_text)``.
+    """
+    voices = list_harvested_voices(Path(VOICES_ROOT))
+    choices = [v['voice_id'] for v in voices]
+    selected = next((v for v in voices if v['voice_id'] == voice_id), None)
+    if selected is None:
+        return gr.update(choices=choices), '', None, ''
+
+    summary = (
+        f"🎙️ **{selected['voice_id']}** — {selected['num_clips']} câu / "
+        f"{selected['total_clean_minutes']:.1f} phút sạch "
+        f"({len(selected['processed_video_ids'])} video đã xử lý)"
+    )
+    if not selected['golden_ref_wav']:
+        summary += '\n⚠️ Chưa có golden reference — hãy cào thêm hoặc kiểm tra lại thư mục.'
+    logger.info(f'🎙️ [VOICE_SELECT] Nạp profile "{selected["voice_id"]}" vào Khu vực 2 (F5-TTS)')
+    return (
+        gr.update(choices=choices),
+        summary,
+        selected['golden_ref_wav'] or None,
+        selected['golden_ref_text'],
+    )
+
+
+def _read_voice_profile(voice_dir: Path) -> dict:
+    """Read one voice profile from disk in the shape the UI needs."""
+    voice_dir = Path(voice_dir)
+    profile_path = voice_dir / 'profile.json'
+    golden_wav = ''
+    golden_text = ''
+    if profile_path.exists():
+        try:
+            raw = json.loads(profile_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            raw = {}
+        golden_rel = raw.get('best_golden_ref_wav')
+        if golden_rel:
+            candidate = voice_dir / golden_rel
+            if candidate.exists():
+                golden_wav = str(candidate)
+        golden_text = raw.get('best_golden_ref_text') or ''
+    if not golden_wav:
+        for candidate in sorted((voice_dir / 'golden_refs').glob('*.wav')):
+            golden_wav = str(candidate)
+            break
+    return {'golden_ref_wav': golden_wav, 'golden_ref_text': golden_text}
+
+
+def _harvested_voice_ids() -> list[str]:
+    """Voice IDs available for the harvester dropdown."""
+    return [v['voice_id'] for v in list_harvested_voices(Path(VOICES_ROOT))]
+
+
+def _load_harvested_voices():
+    """Populate the harvester table and dropdown when the app loads."""
+    return _voice_table_rows(), gr.update(choices=_harvested_voice_ids())
+
+
+def _voice_table_rows() -> list[list[str]]:
+    """Harvested-voice table rows: ``[Voice ID, Số câu, Phút sạch, Golden ref]``."""
+    rows: list[list[str]] = []
+    for voice in list_harvested_voices(Path(VOICES_ROOT)):
+        rows.append(
+            [
+                voice['voice_id'],
+                str(voice['num_clips']),
+                f"{voice['total_clean_minutes']:.1f}",
+                voice['golden_ref_wav'],
+            ]
+        )
+    return rows
 
 
 def handle_select_all_chapters(state: dict):
@@ -303,6 +425,51 @@ def build_app() -> gr.Blocks:
                         placeholder='# Chương 1: Khởi đầu\n\nNội dung chương sách...',
                     )
 
+        # KHU VỰC 1.5 — AUTO VOICE HARVESTER
+        with gr.Group():
+            gr.Markdown(
+                '### 🎙️ Cào & Tuyển chọn Giọng Tự động (Auto Voice Harvester)\n'
+                'Tự động tải video YouTube, tách nhạc nền, cắt câu và lọc giọng chủ kênh '
+                'thành dataset **F5-TTS** & **GPT-SoVITS**. Sau đó chọn profile để tự động '
+                'điền Audio mẫu + Transcript ở **Khu vực 2**.'
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    harvest_voice_id = gr.Textbox(
+                        label='Voice ID (tên profile, ví dụ: vui_ve)',
+                        placeholder='vui_ve',
+                    )
+                    harvest_query = gr.Textbox(
+                        label='Từ khóa tìm kiếm / URL kênh / URL video YouTube',
+                        placeholder='kênh Vui Vẻ hoặc https://www.youtube.com/watch?v=...',
+                    )
+                    with gr.Row():
+                        harvest_minutes = gr.Number(
+                            label='Số phút sạch mục tiêu', value=6.0, minimum=1.0, maximum=60.0
+                        )
+                        harvest_max_videos = gr.Number(
+                            label='Số video tối đa', value=1, minimum=1, maximum=20, precision=0
+                        )
+                    harvest_btn = gr.Button(
+                        '🚀 Bắt đầu Cào & Tuyển chọn Giọng', variant='primary'
+                    )
+                with gr.Column(scale=2):
+                    harvest_status = gr.Textbox(label='Trạng thái cào giọng', interactive=False)
+                    harvested_voice_dropdown = gr.Dropdown(
+                        label='Profile giọng đã cào (chọn để nạp vào Khu vực 2)',
+                        choices=_harvested_voice_ids(),
+                        value=None,
+                        interactive=True,
+                    )
+                    harvested_summary = gr.Markdown('')
+                    harvest_table = gr.Dataframe(
+                        headers=['Voice ID', 'Số câu', 'Phút sạch', 'Golden ref'],
+                        datatype=['str', 'str', 'str', 'str'],
+                        label='Danh sách giọng đã cào',
+                        value=_voice_table_rows(),
+                        interactive=False,
+                    )
+
         # KHU VỰC 2
         with gr.Group():
             gr.Markdown('### 2. Cấu hình Giọng đọc (TTS Engine) & Nghe thử (Preview)')
@@ -372,6 +539,21 @@ def build_app() -> gr.Blocks:
             fn=handle_epub_upload,
             inputs=[epub_input],
             outputs=[state, book_title, book_author, cover_preview, chapter_selector, md_editor],
+        )
+        harvest_btn.click(
+            fn=handle_harvest_voice,
+            inputs=[harvest_voice_id, harvest_query, harvest_minutes, harvest_max_videos],
+            outputs=[harvest_status, f5_ref_audio, f5_ref_text, harvest_table],
+        )
+        harvested_voice_dropdown.change(
+            fn=handle_select_harvested_voice,
+            inputs=[harvested_voice_dropdown],
+            outputs=[harvested_voice_dropdown, harvested_summary, f5_ref_audio, f5_ref_text],
+        )
+        demo.load(
+            fn=_load_harvested_voices,
+            inputs=None,
+            outputs=[harvest_table, harvested_voice_dropdown],
         )
         chapter_selector.change(
             fn=handle_chapter_selection,
