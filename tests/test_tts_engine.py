@@ -32,3 +32,13 @@ def test_render_chapter_stitches_pauses_and_caches_checkpoint(tmp_path: Path):
     res2 = render_chapter(chap, engine, tmp_path, force=False)
     assert engine.calls == calls_after_first
     assert res2.duration_ms == res1.duration_ms
+
+
+def test_edge_tts_non_word_segment_returns_silence(tmp_path: Path):
+    from core.tts_engine import EdgeTTSEngine
+    engine = EdgeTTSEngine()
+    out_wav = tmp_path / 'silence.wav'
+    dur = engine.synthesize_segment('...', out_wav)
+    assert dur == 200
+    assert out_wav.exists()
+

@@ -115,8 +115,8 @@ def normalize_vi_text(text: str) -> str:
     for pattern, repl in _ABBR_MAP.items():
         text = re.sub(pattern, repl, text)
 
-    # Strip remaining markdown inline characters so TTS never reads them aloud
-    text = re.sub(r'[*_~#>]+', ' ', text)
+    # Strip remaining markdown inline characters and XML tags/brackets so TTS never reads them aloud or breaks SSML
+    text = re.sub(r'[*_~#><]+', ' ', text)
     text = re.sub(r'\[(?:\d+|footnote|chú thích)\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -294,6 +294,9 @@ def markdown_to_segments(markdown: str, max_chars: int = 280) -> list[AudioSegme
             chunked.extend(_split_long_sentence(s, max_chars=max_chars))
 
         for idx, chunk in enumerate(chunked):
+            chunk = chunk.strip()
+            if not re.search(r'\w', chunk):
+                continue
             is_last_in_para = idx == len(chunked) - 1
             pause = 800 if is_last_in_para else 400
             segments.append(AudioSegmentSpec(text=chunk, pause_after_ms=pause, is_chapter_title=False))

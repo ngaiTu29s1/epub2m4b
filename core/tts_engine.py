@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -61,13 +62,37 @@ class EdgeTTSEngine(TTSEngine):
         self.rvc_model_path = Path(rvc_model_path) if rvc_model_path else None
         self.rvc_index_path = Path(rvc_index_path) if rvc_index_path else None
 
-    async def _save_mp3(self, text: str, mp3_path: Path) -> None:
-        comm = edge_tts.Communicate(text=text, voice=self.voice, rate=self.rate)
-        await comm.save(str(mp3_path))
+    async def _save_mp3(self, text: str, mp3_path: Path, max_retries: int = 5) -> None:
+        last_exc: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                comm = edge_tts.Communicate(text=text, voice=self.voice, rate=self.rate)
+                await comm.save(str(mp3_path))
+                return
+            except edge_tts.exceptions.NoAudioReceived as exc:
+                last_exc = exc
+                if attempt == max_retries - 1:
+                    break
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except Exception as exc:
+                last_exc = exc
+                if attempt == max_retries - 1:
+                    break
+                await asyncio.sleep(0.5 * (2 ** attempt))
+        if last_exc:
+            raise last_exc
 
     def synthesize_segment(self, text: str, out_wav: Path) -> int:
         out_wav = Path(out_wav)
         out_wav.parent.mkdir(parents=True, exist_ok=True)
+        if not re.search(r'\w', text):
+            with wave.open(str(out_wav), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b'\x00\x00' * int(SAMPLE_RATE * 0.2))
+            return 200
+
         with tempfile.TemporaryDirectory() as tmpd:
             mp3_path = Path(tmpd) / 'seg.mp3'
             asyncio.run(self._save_mp3(text, mp3_path))
