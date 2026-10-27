@@ -29,3 +29,21 @@ def test_markdown_to_segments_assigns_pauses_and_splits_long_sentences():
     assert segs[0].pause_after_ms == 2000
     assert any(s.pause_after_ms == 1500 for s in segs)
     assert all(len(s.text) <= 25 for s in segs)
+
+
+def test_clean_html_converts_vni_encoding_and_heals_broken_pdf_lines():
+    html = '''
+    <html><body>
+      <h1>Chương 1</h1>
+      <p>Ñöùa Treû Hö - Töû Kim Traàn.</p>
+      <p>Bây giờ cậu đã tiếp</p>
+      <p>xúc với hai người này một khoảng thời gian rồi.</p>
+    </body></html>
+    '''
+    _, md = clean_html_to_markdown(html)
+    assert 'Đứa Trẻ Hư - Tử Kim Trần.' in md
+    assert 'Bây giờ cậu đã tiếp xúc với hai người này một khoảng thời gian rồi.' in md
+
+    _, md_uni = clean_html_to_markdown('<p>Cảnh sát hoàn toàn không nghi ngờ toàn trường.</p>')
+    assert 'hoàn toàn không nghi ngờ toàn trường' in md_uni
+

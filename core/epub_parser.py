@@ -65,7 +65,32 @@ def parse_epub(epub_path: Path, workspace_dir: Path) -> BookMetadata:
             continue
         seen_ids.add(item_id)
         raw_html = item.get_content().decode('utf-8', errors='ignore')
-        _, md = clean_html_to_markdown(raw_html, default_title=f'Chương {chap_idx}')
+        _, md = clean_html_to_markdown(raw_html, default_title='', allow_leading_orphan=True)
+        md = md.strip()
+        if not md:
+            continue
+
+        # Handle mid-chapter Calibre split: leading paragraphs before any '# ' heading
+        if not md.startswith('# '):
+            parts = re.split(r'(?=^# )', md, maxsplit=1, flags=re.MULTILINE)
+            orphan_chunk = parts[0].strip()
+            rest_md = parts[1].strip() if len(parts) > 1 else ''
+            if chapters and chapters[-1].enabled and orphan_chunk:
+                chapters[-1].markdown = f'{chapters[-1].markdown.rstrip()}\n\n{orphan_chunk}'
+                md = rest_md
+            elif orphan_chunk:
+                fallback_title = (
+                    'Trang đầu / Thông tin sách'
+                    if _is_boilerplate_chapter('', orphan_chunk)
+                    else f'Chương {chap_idx}'
+                )
+                md = f'# {fallback_title}\n\n{orphan_chunk}' + (
+                    f'\n\n{rest_md}' if rest_md else ''
+                )
+
+        if not md:
+            continue
+
         for sub in parse_book_markdown(md):
             body_check = re.sub(r'^# .*$', '', sub.markdown, flags=re.MULTILINE).strip()
             if not body_check:

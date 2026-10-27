@@ -66,3 +66,39 @@ def test_parse_epub_splits_multi_chapter_calibre_spine_file(tmp_path: Path):
     assert [c.title for c in meta.chapters] == ['PHẦN DẪN', 'CHƯƠNG 1', 'CHƯƠNG 2']
     assert all(c.enabled for c in meta.chapters)
 
+
+def test_parse_epub_merges_mid_chapter_calibre_split(tmp_path: Path):
+    book = epub.EpubBook()
+    book.set_identifier('calibre-mid-split')
+    book.set_title('Sách Cắt Giữa Chương')
+    book.set_language('vi')
+    book.add_author('Tác Giả')
+
+    part1 = epub.EpubHtml(title='P1', file_name='split_001.xhtml', lang='vi')
+    part1.content = (
+        '<html><body>'
+        '<h2>CHƯƠNG 1</h2>'
+        '<p>Đoạn mở đầu của chương một rất dài để đủ tiêu chuẩn không bị lọc bỏ.</p>'
+        '</body></html>'
+    )
+    part2 = epub.EpubHtml(title='P2', file_name='split_002.xhtml', lang='vi')
+    part2.content = (
+        '<html><body>'
+        '<p>Đoạn nửa sau của chương một bị Calibre cắt sang file HTML tiếp theo mà không có tiêu đề.</p>'
+        '<h2>CHƯƠNG 2</h2>'
+        '<p>Đoạn mở đầu của chương hai tiếp nối ngay bên dưới trong cùng file split_002.</p>'
+        '</body></html>'
+    )
+    book.add_item(part1)
+    book.add_item(part2)
+    book.spine = ['nav', part1, part2]
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    epub_path = tmp_path / 'mid_split.epub'
+    epub.write_epub(str(epub_path), book)
+
+    meta = parse_epub(epub_path, tmp_path / 'work_mid')
+    assert [c.title for c in meta.chapters] == ['CHƯƠNG 1', 'CHƯƠNG 2']
+    assert 'Đoạn nửa sau của chương một' in meta.chapters[0].markdown
+
+

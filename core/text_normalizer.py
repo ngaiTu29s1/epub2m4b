@@ -1,9 +1,58 @@
 import re
+import unicodedata
 import warnings
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from core.models import AudioSegmentSpec
 
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
+
+_VNI_DETECT_RE = re.compile(
+    r'(?:Ñ|ñ|ö|Ö|æ|Æ|î|Î|'
+    r'[aeouyAEOUY][ùøûõïÙØÛÕÏ]|'
+    r'[aeoAEO][âåäÂÅÄ]|'
+    r'[aeAE][áàãÁÀÃ]|'
+    r'[aA][êéèúüëÊÉÈÚÜË])'
+)
+
+_VNI_PAIRS = [
+    ('aù', 'á'), ('aø', 'à'), ('aû', 'ả'), ('aõ', 'ã'), ('aï', 'ạ'),
+    ('aâ', 'â'), ('aá', 'ấ'), ('aà', 'ầ'), ('aå', 'ẩ'), ('aã', 'ẫ'), ('aä', 'ậ'),
+    ('aê', 'ă'), ('aé', 'ắ'), ('aè', 'ằ'), ('aú', 'ẳ'), ('aü', 'ẵ'), ('aë', 'ặ'),
+    ('AÙ', 'Á'), ('AØ', 'À'), ('AÛ', 'Ả'), ('AÕ', 'Ã'), ('AÏ', 'Ạ'),
+    ('AÂ', 'Â'), ('AÁ', 'Ấ'), ('AÀ', 'Ầ'), ('AÅ', 'Ẩ'), ('AÃ', 'Ẫ'), ('AÄ', 'Ậ'),
+    ('AÊ', 'Ă'), ('AÉ', 'Ắ'), ('AÈ', 'Ằ'), ('AÚ', 'Ẳ'), ('AÜ', 'Ẵ'), ('AË', 'Ặ'),
+    ('eù', 'é'), ('eø', 'è'), ('eû', 'ẻ'), ('eõ', 'ẽ'), ('eï', 'ẹ'),
+    ('eâ', 'ê'), ('eá', 'ế'), ('eà', 'ề'), ('eå', 'ể'), ('eã', 'ễ'), ('eä', 'ệ'),
+    ('EÙ', 'É'), ('EØ', 'È'), ('EÛ', 'Ẻ'), ('EÕ', 'Ẽ'), ('EÏ', 'Ẹ'),
+    ('EÂ', 'Ê'), ('EÁ', 'Ế'), ('EÀ', 'Ề'), ('EÅ', 'Ể'), ('EÃ', 'Ễ'), ('EÄ', 'Ệ'),
+    ('où', 'ó'), ('oø', 'ò'), ('oû', 'ỏ'), ('oõ', 'õ'), ('oï', 'ọ'),
+    ('oâ', 'ô'), ('oá', 'ố'), ('oà', 'ồ'), ('oå', 'ổ'), ('oã', 'ỗ'), ('oä', 'ộ'),
+    ('ôù', 'ớ'), ('ôø', 'ờ'), ('ôû', 'ở'), ('ôõ', 'ỡ'), ('ôï', 'ợ'),
+    ('OÙ', 'Ó'), ('OØ', 'Ò'), ('OÛ', 'Ỏ'), ('OÕ', 'Õ'), ('OÏ', 'Ọ'),
+    ('OÂ', 'Ô'), ('OÁ', 'Ố'), ('OÀ', 'Ồ'), ('OÅ', 'Ổ'), ('OÃ', 'Ỗ'), ('OÄ', 'Ộ'),
+    ('ÔÙ', 'Ớ'), ('ÔØ', 'Ờ'), ('ÔÛ', 'Ở'), ('ÔÕ', 'Ỡ'), ('ÔÏ', 'Ợ'),
+    ('uù', 'ú'), ('uø', 'ù'), ('uû', 'ủ'), ('uõ', 'ũ'), ('uï', 'ụ'),
+    ('öù', 'ứ'), ('öø', 'ừ'), ('öû', 'ử'), ('öõ', 'ữ'), ('öï', 'ự'),
+    ('UÙ', 'Ú'), ('UØ', 'Ù'), ('UÛ', 'Ủ'), ('UÕ', 'Ũ'), ('UÏ', 'Ụ'),
+    ('ÖÙ', 'Ứ'), ('ÖØ', 'Ừ'), ('ÖÛ', 'Ử'), ('ÖÕ', 'Ữ'), ('ÖÏ', 'Ự'),
+    ('yù', 'ý'), ('yø', 'ỳ'), ('yû', 'ỷ'), ('yõ', 'ỹ'),
+    ('YÙ', 'Ý'), ('YØ', 'Ỳ'), ('YÛ', 'Ỷ'), ('YÕ', 'Ỹ'),
+    ('Ñ', 'Đ'), ('ñ', 'đ'), ('Ö', 'Ư'), ('ö', 'ư'), ('æ', 'ỉ'), ('Æ', 'Ỉ'), ('î', 'ỵ'), ('Î', 'Ỵ'),
+]
+
+_LOWER_VI_START_RE = re.compile(
+    r'^[a-zàáảãạăằắẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ]'
+)
+_SENTENCE_END_RE = re.compile(r'[.!?…:;\"”\')\]»]$')
+
+
+def convert_vni_to_unicode(text: str) -> str:
+    text = unicodedata.normalize('NFC', text)
+    if not _VNI_DETECT_RE.search(text):
+        return text
+    for src, dst in _VNI_PAIRS:
+        text = text.replace(src, dst)
+    return unicodedata.normalize('NFC', text)
 
 _CHAPTER_HEADING_RE = re.compile(
     r'^(chương|phần|quyển|hồi|tập|mục|giới thiệu|lời mở đầu|lời nói đầu|'
@@ -74,7 +123,9 @@ def normalize_vi_text(text: str) -> str:
     return text
 
 
-def clean_html_to_markdown(html: str, default_title: str = '') -> tuple[str, str]:
+def clean_html_to_markdown(
+    html: str, default_title: str = '', allow_leading_orphan: bool = False
+) -> tuple[str, str]:
     soup = BeautifulSoup(html, 'lxml')
 
     for tag in soup(['script', 'style', 'sup', 'nav', 'footer', 'header']):
@@ -105,7 +156,7 @@ def clean_html_to_markdown(html: str, default_title: str = '') -> tuple[str, str
         if elem.name == 'hr':
             blocks.append('---')
             continue
-        raw = elem.get_text(' ', strip=True)
+        raw = convert_vni_to_unicode(elem.get_text(' ', strip=True))
         if not raw:
             continue
         # Strip inline URLs, footnote brackets, markdown chars
@@ -142,15 +193,26 @@ def clean_html_to_markdown(html: str, default_title: str = '') -> tuple[str, str
             if not blocks or blocks[-1] != h1_line:
                 blocks.append(h1_line)
         else:
-            blocks.append(raw)
+            if (
+                blocks
+                and not blocks[-1].startswith('#')
+                and blocks[-1] != '---'
+                and not _SENTENCE_END_RE.search(blocks[-1])
+                and _LOWER_VI_START_RE.match(raw)
+            ):
+                blocks[-1] = f'{blocks[-1]} {raw}'
+            else:
+                blocks.append(raw)
 
     if not blocks and not first_title:
-        fallback = re.sub(r'\s+', ' ', body.get_text(' ', strip=True)).strip()
+        fallback = convert_vni_to_unicode(
+            re.sub(r'\s+', ' ', body.get_text(' ', strip=True)).strip()
+        )
         if fallback:
             blocks.append(fallback)
 
     title = first_title or default_title.strip() or 'Chương không tên'
-    if not blocks or not blocks[0].startswith('# '):
+    if not allow_leading_orphan and (not blocks or not blocks[0].startswith('# ')):
         blocks.insert(0, f'# {title}')
 
     md_lines: list[str] = []
