@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from core.voice_harvester import slice_and_filter_segments
+from core.voice_harvester import RawAudioCandidate, filter_dominant_speaker, slice_and_filter_segments
 
 
 def _write_test_wav(path: Path, segments_amp: list[tuple[float, float]], sr: int = 24000) -> Path:
@@ -41,3 +41,23 @@ def test_slice_and_filter_keeps_padded_clean_speech_and_drops_loud_bgm(tmp_path:
     assert kept[0].vocal_to_bgm_db >= 8.0
     # 4.5s speech + 0.2s head pad + 0.2s tail pad = ~4.9s
     assert 4.7 <= (kept[0].end_sec - kept[0].start_sec) <= 5.1
+
+
+def test_filter_dominant_speaker_drops_guest_voice_outliers(tmp_path: Path):
+    c1 = RawAudioCandidate(tmp_path / '1.wav', 0, 5, 15.0, -18.0, -3.0)
+    c2 = RawAudioCandidate(tmp_path / '2.wav', 5, 10, 15.0, -18.0, -3.0)
+    c3 = RawAudioCandidate(tmp_path / '3.wav', 10, 15, 15.0, -18.0, -3.0)
+    guest = RawAudioCandidate(tmp_path / 'guest.wav', 15, 20, 15.0, -18.0, -3.0)
+
+    fake_vecs = {
+        c1.path: np.array([0.98, 0.15, 0.05], dtype=np.float32),
+        c2.path: np.array([0.97, 0.18, 0.04], dtype=np.float32),
+        c3.path: np.array([0.99, 0.12, 0.06], dtype=np.float32),
+        guest.path: np.array([0.10, 0.95, -0.25], dtype=np.float32),
+    }
+    kept = filter_dominant_speaker(
+        [c1, c2, c3, guest],
+        min_similarity=0.78,
+        embed_fn=lambda p: fake_vecs[p] / np.linalg.norm(fake_vecs[p]),
+    )
+    assert [k.path.name for k in kept] == ['1.wav', '2.wav', '3.wav']

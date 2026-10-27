@@ -279,3 +279,194 @@ def slice_and_filter_segments(
         f'(pad={pad_ms}ms, min_snr={min_snr_db}dB)'
     )
     return candidates
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — Dominant speaker clustering
+# ---------------------------------------------------------------------------
+
+EMBED_DIM = 48
+MEL_BANDS = 40
+CENTROID_NEIGHBOR_RATIO = 0.6
+
+
+def _hz_to_mel(freq: np.ndarray | float) -> np.ndarray:
+    return 2595.0 * np.log10(1.0 + np.asarray(freq, dtype=np.float64) / 700.0)
+
+
+def _mel_to_hz(mel: np.ndarray | float) -> np.ndarray:
+    return 700.0 * (np.power(10.0, np.asarray(mel, dtype=np.float64) / 2595.0) - 1.0)
+
+
+def _mel_filterbank(n_fft: int, sr: int, bands: int = MEL_BANDS) -> np.ndarray:
+    freqs = np.linspace(0.0, sr / 2.0, n_fft // 2 + 1)
+    mel_edges = np.linspace(_hz_to_mel(0.0), _hz_to_mel(sr / 2.0), bands + 2)
+    hz_edges = _mel_to_hz(mel_edges)
+    bank = np.zeros((bands, freqs.size), dtype=np.float64)
+    for b in range(bands):
+        left, center, right = hz_edges[b], hz_edges[b + 1], hz_edges[b + 2]
+        rising = np.clip((freqs - left) / max(center - left, 1e-9), 0.0, 1.0)
+        falling = np.clip((right - freqs) / max(right - center, 1e-9), 0.0, 1.0)
+        bank[b] = np.minimum(rising, falling)
+    return bank
+
+
+def _log_mel_stats(samples: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and standard deviation of log-mel energies (per band)."""
+    n_fft = 1024
+    hop = max(1, n_fft // 4)
+    if samples.size < n_fft:
+        samples = np.pad(samples, (0, n_fft - samples.size))
+
+    n_frames = 1 + (samples.size - n_fft) // hop
+    window = np.hanning(n_fft)
+    frames = np.stack([samples[i * hop : i * hop + n_fft] * window for i in range(n_frames)])
+    spectrum = np.abs(np.fft.rfft(frames, axis=1)) ** 2
+    mel = spectrum @ _mel_filterbank(n_fft, sr).T
+    log_mel = np.log10(np.maximum(mel, 1e-10))
+    return log_mel.mean(axis=0), log_mel.std(axis=0)
+
+
+def _spectral_centroid(samples: np.ndarray, sr: int) -> float:
+    n_fft = 1024
+    if samples.size < n_fft:
+        samples = np.pad(samples, (0, n_fft - samples.size))
+    spectrum = np.abs(np.fft.rfft(samples[:n_fft] * np.hanning(n_fft)))
+    freqs = np.fft.rfftfreq(n_fft, 1.0 / sr)
+    total = float(spectrum.sum())
+    if total <= 1e-12:
+        return 0.0
+    return float((spectrum * freqs).sum() / total)
+
+
+def _zero_crossing_rate(samples: np.ndarray) -> float:
+    if samples.size < 2:
+        return 0.0
+    return float(np.mean(np.abs(np.diff(np.signbit(samples).astype(np.int8)))))
+
+
+def compute_speaker_embedding(wav_path: Path) -> np.ndarray:
+    """L2-normalized timbre fingerprint of one clip (log-mel + pitch/spectral stats).
+
+    Deliberately lightweight (numpy only, no neural speaker model) so the
+    offline test suite can exercise the whole pipeline, while real timbre
+    differences (voice colour, pitch, formants) still separate speakers.
+    """
+    samples, sr = _read_mono(Path(wav_path))
+    if samples.size == 0:
+        return np.zeros(EMBED_DIM, dtype=np.float32)
+
+    peak = float(np.max(np.abs(samples)))
+    if peak > 1e-9:
+        samples = samples / peak
+
+    mel_mean, mel_std = _log_mel_stats(samples, sr)
+    centroid = _spectral_centroid(samples, sr)
+    zcr = _zero_crossing_rate(samples)
+
+    frame_len = max(1, int(round(sr * 0.04)))
+    frames = [samples[i : i + frame_len] for i in range(0, samples.size - frame_len + 1, frame_len)]
+    if frames:
+        frame_db = np.array([_db(f) for f in frames], dtype=np.float64)
+        voiced = frame_db > (np.max(frame_db) - 25.0)
+        voiced_frames = [f for f, keep in zip(frames, voiced) if keep] or frames
+        autocorr_pitch = []
+        for frame in voiced_frames[:400]:
+            win = frame - float(np.mean(frame))
+            ac = np.correlate(win, win, mode='full')[win.size - 1 :]
+            lo = max(1, int(sr / 400.0))
+            hi = min(ac.size - 1, int(sr / 60.0))
+            if hi <= lo:
+                continue
+            lag = lo + int(np.argmax(ac[lo:hi]))
+            autocorr_pitch.append(sr / float(lag))
+        pitch_mean = float(np.mean(autocorr_pitch)) if autocorr_pitch else 0.0
+        pitch_std = float(np.std(autocorr_pitch)) if autocorr_pitch else 0.0
+    else:
+        pitch_mean = pitch_std = 0.0
+
+    extras = np.array(
+        [
+            math.log1p(centroid) / 10.0,
+            math.log1p(pitch_mean) / 10.0,
+            pitch_std / 100.0,
+            zcr,
+            compute_rms_dbfs(samples) / 60.0,
+            compute_peak_dbfs(samples) / 20.0,
+        ],
+        dtype=np.float64,
+    )
+
+    vector = np.concatenate(
+        [
+            mel_mean * 2.0,
+            mel_std,
+            extras,
+        ]
+    ).astype(np.float64)
+
+    norm = float(np.linalg.norm(vector))
+    if norm <= 1e-12:
+        return np.zeros(EMBED_DIM, dtype=np.float32)
+    return (vector / norm).astype(np.float32)
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na <= 1e-12 or nb <= 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _dominant_centroid(vectors: np.ndarray) -> np.ndarray:
+    """Medoid-style centroid robust to guest-voice outliers.
+
+    For each candidate, average the cosine similarity to its top 60% most
+    similar neighbours; the highest-scoring candidate is the dense medoid.
+    Guest voices never drag the centroid because they are a minority and
+    therefore never appear in another speaker's top-neighbour window.
+    """
+    n = vectors.shape[0]
+    if n == 0:
+        return np.zeros(EMBED_DIM, dtype=np.float32)
+    if n == 1:
+        return vectors[0]
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    normalized = vectors / np.maximum(norms, 1e-12)
+    sims = normalized @ normalized.T
+
+    k = max(1, int(math.ceil(n * CENTROID_NEIGHBOR_RATIO)))
+    scores = np.empty(n, dtype=np.float64)
+    for i in range(n):
+        row = np.sort(sims[i])[::-1][:k]
+        scores[i] = float(np.mean(row))
+    return vectors[int(np.argmax(scores))]
+
+
+def filter_dominant_speaker(
+    candidates: list[RawAudioCandidate],
+    min_similarity: float = 0.78,
+    embed_fn: Callable[[Path], np.ndarray] = compute_speaker_embedding,
+) -> list[RawAudioCandidate]:
+    """Keep only clips that match the dominant (channel-owner) speaker.
+
+    Drops guest voices, interviews and inserted advertisements whose cosine
+    similarity to the dominant cluster centroid is ``< min_similarity``.
+    """
+    if not candidates:
+        return []
+
+    vectors = np.stack([np.asarray(embed_fn(c.path), dtype=np.float64) for c in candidates])
+    centroid = _dominant_centroid(vectors)
+
+    kept: list[RawAudioCandidate] = []
+    for candidate, vector in zip(candidates, vectors):
+        similarity = _cosine(vector, centroid)
+        if similarity >= min_similarity:
+            kept.append(candidate)
+        else:
+            logger.info(f'🚫 [SPEAKER] Loại {candidate.path.name}: cosine={similarity:.3f} < {min_similarity}')
+    logger.info(f'🗣️ [SPEAKER] Giữ {len(kept)}/{len(candidates)} câu thuộc giọng chủ kênh')
+    return kept
