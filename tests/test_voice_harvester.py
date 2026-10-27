@@ -11,6 +11,7 @@ from core.voice_harvester import (
     curate_and_export_dataset,
     discover_and_download_videos,
     filter_dominant_speaker,
+    load_sliced_candidates,
     slice_and_filter_segments,
 )
 
@@ -50,6 +51,40 @@ def test_slice_and_filter_keeps_padded_clean_speech_and_drops_loud_bgm(tmp_path:
     assert kept[0].vocal_to_bgm_db >= 8.0
     # 4.5s speech + 0.2s head pad + 0.2s tail pad = ~4.9s
     assert 4.7 <= (kept[0].end_sec - kept[0].start_sec) <= 5.1
+
+
+def test_slice_and_filter_keeps_hot_mastered_speech_but_drops_true_clipping(tmp_path: Path):
+    """Hot-mastered audio (peak ~0 dBFS in a full mix) is usable, pinned audio is not.
+
+    YouTube uploads are mastered to full scale, so a peak `>= -0.2 dBFS` is
+    normal and only real clipping (energy pinned at full scale) is rejected.
+    Without `inst_wav` there is no BGM reference, so the SNR gate is skipped and
+    the clipping gate is what is under test here.
+    """
+    hot_path = _write_test_wav(tmp_path / 'hot.wav', [(6.0, 0.9999)])
+    pinned_path = _write_test_wav(tmp_path / 'pinned.wav', [(6.0, 0.25)])
+    pinned, sr = sf.read(str(pinned_path), dtype='float32')
+    pinned = np.clip(pinned * 40.0, -1.0, 1.0).astype(np.float32)
+    sf.write(str(pinned_path), pinned, sr, subtype='PCM_16')
+
+    kept = slice_and_filter_segments(
+        vocal_wav=hot_path,
+        out_dir=tmp_path / 'hot_clips',
+        min_sec=3.5,
+        max_sec=12.0,
+        pad_ms=200,
+    )
+    assert len(kept) == 1
+    assert kept[0].peak_dbfs >= -0.2
+
+    rejected = slice_and_filter_segments(
+        vocal_wav=pinned_path,
+        out_dir=tmp_path / 'pinned_clips',
+        min_sec=3.5,
+        max_sec=12.0,
+        pad_ms=200,
+    )
+    assert rejected == []
 
 
 def test_filter_dominant_speaker_drops_guest_voice_outliers(tmp_path: Path):
@@ -114,6 +149,51 @@ def test_curate_and_export_drops_low_word_prob_and_exports_golden_refs(tmp_path:
     assert res.f5_metadata_path.exists()
     assert 'wavs/clip_0001.wav|Xin chào mọi người' in res.f5_metadata_path.read_text(encoding='utf-8')
     assert '|vui_ve|VI|Xin chào mọi người' in res.gpt_sovits_list_path.read_text(encoding='utf-8')
+
+
+def test_curate_keeps_real_clean_clip_with_one_low_confidence_word(tmp_path: Path):
+    """Calibration: a real clean Vietnamese clip must survive the ASR gate.
+
+    Measured with faster-whisper large-v3-turbo on real YouTube speech: mean word
+    probability 0.948-0.951 with one word as low as 0.739 (1/20 below 0.92).
+    A per-word minimum gate rejects every such clip (observed 0/85 kept).
+    """
+    candidate = RawAudioCandidate(
+        path=_write_test_wav(tmp_path / 'real_clip.wav', [(5.0, 0.3)]),
+        start_sec=0.0,
+        end_sec=5.0,
+        vocal_to_bgm_db=14.0,
+        rms_dbfs=-20.0,
+        peak_dbfs=-0.5,
+    )
+    measured = [1.0, 0.99, 0.98, 0.95, 0.99, 0.96, 0.94, 0.95, 0.97, 0.94,
+                0.96, 0.95, 0.98, 0.97, 0.94, 0.96, 0.99, 0.95, 0.97, 0.739]
+
+    def fake_transcribe(_path: Path):
+        return [TranscribedWord(f'word{i}', p) for i, p in enumerate(measured)]
+
+    res = curate_and_export_dataset(
+        voice_id='vui_ve',
+        candidates=[candidate],
+        voices_root=tmp_path / 'voices',
+        transcribe_fn=fake_transcribe,
+    )
+    assert len(res.kept_clips) == 1
+    assert len(res.golden_refs) == 1
+
+
+def test_load_sliced_candidates_round_trips_sidecar_metadata(tmp_path: Path):
+    """A crash during transcription must not lose already-sliced audio."""
+    vocal_path = _write_test_wav(tmp_path / 'vocal.wav', [(6.0, 0.3)])
+    out_dir = tmp_path / 'clips'
+    written = slice_and_filter_segments(vocal_path, out_dir, pad_ms=200)
+    assert len(written) == 1
+
+    reloaded = load_sliced_candidates(out_dir)
+    assert len(reloaded) == 1
+    assert reloaded[0].path == written[0].path
+    assert reloaded[0].vocal_to_bgm_db == written[0].vocal_to_bgm_db
+    assert round(reloaded[0].duration_sec, 3) == round(written[0].duration_sec, 3)
 
 
 def test_discover_and_download_skips_already_processed_video_ids(tmp_path: Path):

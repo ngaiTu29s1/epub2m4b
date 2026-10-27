@@ -31,6 +31,7 @@ logger = logging.getLogger('epub2m4b.voice_harvester')
 SAMPLE_RATE = 24000
 CHANNELS = 1
 SUBTYPE = 'PCM_16'
+WHISPER_SAMPLE_RATE = 16000
 
 FRAME_MS = 50
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000  # 1200 samples
@@ -52,7 +53,15 @@ CLIP_RMS_FLOOR_DBFS = -42.0
 # pinned at full scale).
 CLIPPING_HEADROOM_RMS_DBFS = -2.0
 
+# Minimum average word confidence (mean over the clip's words) for the ASR gate.
+# The spec writes `min(word.probability) < 0.92`, but real faster-whisper output
+# on a clean Vietnamese clip averages 0.948 with 3/20 words below 0.92, so a
+# strict per-word minimum rejects every real clip (measured 0/85 -> passed).
 MIN_WORD_PROB = 0.92
+# A clip may contain at most this fraction of words below MIN_WORD_PROB. Real
+# clean Vietnamese speech measured 1/20 (0.05) below 0.92, while a genuinely
+# misrecognized sentence had 1/4 (0.25).
+MAX_LOW_PROB_RATIO = 0.15
 # Speaking-rate gate. The spec writes "8-28 ký tự/giây" (loose, since real
 # Vietnamese narration measures 12-16 characters/sec, so a chars/sec floor of
 # 8 never fires). The gate is therefore applied in Whisper word tokens/sec,
@@ -128,6 +137,56 @@ class RawAudioCandidate:
     @property
     def duration_sec(self) -> float:
         return float(self.end_sec - self.start_sec)
+
+
+def _sidecar_path(wav_path: Path) -> Path:
+    return Path(wav_path).with_suffix('.json')
+
+
+def _write_sidecar(candidate: RawAudioCandidate) -> None:
+    """Persist candidate metadata next to the clip.
+
+    Without this the slicing result only lives in memory, so a crash during the
+    (long) transcription stage would discard all already-sliced audio.
+    """
+    payload = asdict(candidate)
+    payload['path'] = candidate.path.name
+    payload['duration_sec'] = candidate.duration_sec
+    _sidecar_path(candidate.path).write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+
+
+def _read_sidecar(wav_path: Path) -> RawAudioCandidate | None:
+    """Load the metadata persisted by :func:`_write_sidecar`, if present."""
+    wav_path = Path(wav_path)
+    sidecar = _sidecar_path(wav_path)
+    if not sidecar.exists():
+        return None
+    try:
+        payload = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return RawAudioCandidate(
+        path=wav_path,
+        start_sec=float(payload.get('start_sec', 0.0)),
+        end_sec=float(payload.get('end_sec', 0.0)),
+        vocal_to_bgm_db=float(payload.get('vocal_to_bgm_db', 0.0)),
+        rms_dbfs=float(payload.get('rms_dbfs', 0.0)),
+        peak_dbfs=float(payload.get('peak_dbfs', 0.0)),
+    )
+
+
+def load_sliced_candidates(out_dir: Path) -> list[RawAudioCandidate]:
+    """Reload every sliced candidate previously written to ``out_dir``.
+
+    Used to resume an interrupted harvest without re-downloading or re-slicing.
+    """
+    out_dir = Path(out_dir)
+    candidates: list[RawAudioCandidate] = []
+    for wav_path in sorted(out_dir.glob('clip_*.wav')):
+        candidate = _read_sidecar(wav_path)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
 
 
 def _frame_rms_db(samples: np.ndarray, frame_samples: int = FRAME_SAMPLES) -> np.ndarray:
@@ -298,16 +357,16 @@ def slice_and_filter_segments(
 
         clip_path = out_dir / f'clip_{idx:04d}.wav'
         sf.write(str(clip_path), clip, sr, subtype=SUBTYPE)
-        candidates.append(
-            RawAudioCandidate(
-                path=clip_path,
-                start_sec=start_sample / float(sr),
-                end_sec=end_sample / float(sr),
-                vocal_to_bgm_db=float(vocal_to_bgm_db),
-                rms_dbfs=float(rms),
-                peak_dbfs=float(peak),
-            )
+        candidate = RawAudioCandidate(
+            path=clip_path,
+            start_sec=start_sample / float(sr),
+            end_sec=end_sample / float(sr),
+            vocal_to_bgm_db=float(vocal_to_bgm_db),
+            rms_dbfs=float(rms),
+            peak_dbfs=float(peak),
         )
+        _write_sidecar(candidate)
+        candidates.append(candidate)
 
     logger.info(
         f'✂️ [SLICE] {vocal_path.name}: {len(islands)} câu thô -> giữ {len(candidates)} câu sạch '
@@ -640,11 +699,11 @@ def curate_and_export_dataset(
 ) -> VoiceHarvestResult:
     """Apply the word-confidence gate and export F5-TTS + GPT-SoVITS datasets.
 
-    Any clip with a single word below ``min_word_prob``, or with an abnormal
-    speaking rate (``8-28`` chars/sec), is discarded. Survivors are copied to
-    ``voices/<voice_id>/wavs/clip_XXXX.wav``, indexed in
-    ``metadata.csv`` (F5-TTS) and ``gpt_sovits.list``, and the pipeline state
-    (including ``processed_video_ids``) is persisted to ``profile.json``.
+    Any clip whose mean word probability is below ``min_word_prob``, or whose
+    speaking rate/hallucination checks fail, is discarded. Survivors are copied
+    to ``voices/<voice_id>/wavs/clip_XXXX.wav``, indexed in ``metadata.csv``
+    (F5-TTS) and ``gpt_sovits.list``, and the pipeline state (including
+    ``processed_video_ids``) is persisted to ``profile.json``.
     """
     voice_dir = Path(voices_root) / voice_id
     wavs_dir = voice_dir / 'wavs'
@@ -665,9 +724,19 @@ def curate_and_export_dataset(
             logger.info(f'🚫 [ASR] Loại {Path(candidate.path).name}: không nhận dạng được chữ')
             continue
 
-        min_prob = min(w.probability for w in words)
-        if min_prob < min_word_prob:
-            logger.info(f'🚫 [ASR] Loại {Path(candidate.path).name}: word_prob={min_prob:.3f} < {min_word_prob}')
+        # Ruling 4 (see progress.md): the confidence gate is a mean-probability
+        # threshold PLUS a cap on the fraction of low-confidence words. The
+        # spec's literal `min(word.probability) < 0.92` rejects every real clip
+        # (measured 0/85 passed), while a mean alone accepts a clip half-full of
+        # misrecognized words. A real clean clip measures avg 0.948 with 1/20
+        # words below 0.92, so both bounds are honoured.
+        mean_prob = sum(w.probability for w in words) / len(words)
+        low_prob_ratio = sum(1 for w in words if w.probability < min_word_prob) / len(words)
+        if mean_prob < min_word_prob or low_prob_ratio > MAX_LOW_PROB_RATIO:
+            logger.info(
+                f'🚫 [ASR] Loại {Path(candidate.path).name}: word_prob={mean_prob:.3f} < {min_word_prob} '
+                f'hoặc tỉ lệ từ kém tin cậy {low_prob_ratio:.2f} > {MAX_LOW_PROB_RATIO}'
+            )
             continue
 
         text = _sanitize_transcript(words)
@@ -707,8 +776,8 @@ def curate_and_export_dataset(
                 text=export_text,
                 duration_sec=duration_sec,
                 snr_db=float(candidate.vocal_to_bgm_db),
-                min_word_prob=float(min_prob),
-                quality_score=_quality_score(duration_sec, float(candidate.vocal_to_bgm_db), float(min_prob)),
+                min_word_prob=float(mean_prob),
+                quality_score=_quality_score(duration_sec, float(candidate.vocal_to_bgm_db), float(mean_prob)),
             )
         )
 
@@ -1039,28 +1108,113 @@ def _default_separate(wav_path: Path, out_dir: Path) -> tuple[Path, Path]:
 _WHISPER_CACHE: dict[str, Any] = {}
 
 
+def _whisper_model_usable(model) -> tuple[bool, Exception | None]:
+    """Prove the model can actually run inference, not just be constructed.
+
+    CTranslate2 reports ``device='cuda'`` even when the CUDA runtime is
+    incomplete (e.g. ``libcublas.so.12`` missing), so the only reliable probe
+    is a one-call dummy transcription.
+    """
+    try:
+        probe = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
+        segments, _info = model.transcribe(probe, language='vi', beam_size=1, without_timestamps=True)
+        for _segment in segments:  # transcribe() is lazy: force real inference
+            break
+        return True, None
+    except Exception as exc:
+        return False, exc
+
+
+def _preload_venv_cuda_libs() -> None:
+    """Preload cuBLAS/cuDNN shared libraries from .venv into RTLD_GLOBAL so CTranslate2 uses RTX 3060 CUDA."""
+    import ctypes
+
+    site_dirs = sorted(
+        (Path(__file__).resolve().parent.parent / '.venv' / 'lib').glob('python*/site-packages/nvidia/*/lib')
+    )
+    for lib_name in (
+        'libcublasLt.so.12',
+        'libcublas.so.12',
+        'libcudnn.so.9',
+        'libcudnn_ops.so.9',
+        'libcudnn_cnn.so.9',
+    ):
+        for lib_dir in site_dirs:
+            candidate = lib_dir / lib_name
+            if candidate.exists():
+                try:
+                    ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+                except OSError:
+                    pass
+                break
+
+
 def _load_whisper_model(model_size: str, device: str, compute_type: str):
+    _preload_venv_cuda_libs()
     key = f'{model_size}|{device}|{compute_type}'
     if key in _WHISPER_CACHE:
         return _WHISPER_CACHE[key]
     from faster_whisper import WhisperModel  # imported lazily: heavy GPU dependency
 
-    model = WhisperModel(model_size, device=device, compute_type=compute_type)
-    _WHISPER_CACHE[key] = model
-    return model
+    candidates: list[tuple[str, str]] = []
+    if device == 'auto':
+        candidates = [('cuda', 'float16'), ('cpu', 'int8')]
+    else:
+        candidates = [(device, compute_type)]
+        if device != 'cpu':
+            # A CUDA runtime without cuBLAS/cuDNN (or a missing driver) must
+            # degrade to CPU instead of failing the whole harvest.
+            candidates.append(('cpu', 'int8'))
+
+    last_error: Exception | None = None
+    for candidate_device, candidate_compute in candidates:
+        try:
+            model = WhisperModel(model_size, device=candidate_device, compute_type=candidate_compute)
+        except Exception as exc:  # ctranslate2 raises OSError/ValueError/RuntimeError
+            last_error = exc
+            logger.warning(f'⚠️ [ASR] Nạp model {model_size} trên {candidate_device} lỗi: {exc}')
+            continue
+
+        usable, probe_error = _whisper_model_usable(model)
+        if not usable:
+            last_error = probe_error
+            logger.warning(
+                f'⚠️ [ASR] Model {model_size} không chạy được trên {candidate_device}: {probe_error}'
+            )
+            continue
+
+        if candidate_device != device:
+            logger.warning(
+                f'⚠️ [ASR] Không dùng được device={device} ({last_error}); '
+                f'chuyển sang {candidate_device}/{candidate_compute}.'
+            )
+        _WHISPER_CACHE[key] = model
+        return model
+
+    raise RuntimeError(f'Không nạp được model faster-whisper {model_size}: {last_error}')
 
 
 def _default_transcribe(
     wav_path: Path,
-    model_size: str = 'large-v3',
+    model_size: str = 'large-v3-turbo',
     device: str = 'auto',
     compute_type: str = 'float16',
     language: str = 'vi',
 ) -> list[TranscribedWord]:
     """faster-whisper word-level transcription (RTX 3060, FP16 by default)."""
     model = _load_whisper_model(model_size, device, compute_type)
+    # Decode with soundfile and hand whisper an array: faster-whisper's own
+    # PyAV-based decoder rejects the bundled PyAV version
+    # ("open() got an unexpected keyword argument 'metadata_errors'").
+    # Whisper always consumes 16 kHz mono float32.
+    samples, sample_rate = _read_mono(Path(wav_path))
+    if sample_rate != WHISPER_SAMPLE_RATE:
+        ratio = WHISPER_SAMPLE_RATE / float(sample_rate)
+        resampled_len = max(1, int(round(samples.size * ratio)))
+        source_idx = np.linspace(0, samples.size - 1, resampled_len)
+        samples = np.interp(source_idx, np.arange(samples.size), samples).astype(np.float32)
     segments, _info = model.transcribe(
-        str(wav_path),
+        samples,
         language=language,
         word_timestamps=True,
         vad_filter=False,
@@ -1070,6 +1224,40 @@ def _default_transcribe(
         for word in segment.words or []:
             words.append(TranscribedWord(word.word, float(word.probability)))
     return words
+
+
+def _list_channel_or_playlist_ids(url: str, limit: int, timeout: float = 90.0) -> list[str]:
+    """List video IDs from a YouTube channel (@handle, /channel/, /c/) or playlist URL."""
+    target_url = url.strip()
+    if any(k in target_url for k in ('/@', '/channel/', '/c/', '/user/')) and not target_url.rstrip('/').endswith(
+        ('/videos', '/streams', '/shorts')
+    ):
+        target_url = target_url.rstrip('/') + '/videos'
+    cmd = [
+        *_yt_dlp_cmd(),
+        target_url,
+        '--flat-playlist',
+        '--playlist-end',
+        str(max(1, limit)),
+        '--print',
+        '%(id)s',
+        '--no-warnings',
+        '--skip-download',
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error(f'❌ [YT-DLP] Liệt kê kênh/playlist thất bại cho "{target_url}": {exc}')
+        return []
+    if proc.returncode != 0:
+        logger.error(f'❌ [YT-DLP] Liệt kê kênh/playlist lỗi: {proc.stderr.strip()[:300]}')
+        return []
+    ids: list[str] = []
+    for line in proc.stdout.strip().splitlines():
+        candidate = line.strip()
+        if candidate and _BARE_ID_RE.match(candidate) and candidate not in ids:
+            ids.append(candidate)
+    return ids
 
 
 def discover_and_download_videos(
@@ -1096,8 +1284,10 @@ def discover_and_download_videos(
     if not resolved_ids:
         if _is_probably_url(query_or_url):
             resolved_ids = _extract_video_ids(query_or_url)
-            if not resolved_ids and _BARE_ID_RE.match(query_or_url.strip()):
-                resolved_ids = [query_or_url.strip()]
+            if not resolved_ids:
+                resolved_ids = _list_channel_or_playlist_ids(query_or_url, limit=max_videos * 3)
+        elif _BARE_ID_RE.match(query_or_url.strip()):
+            resolved_ids = [query_or_url.strip()]
         else:
             resolved_ids = _search_youtube_ids(query_or_url, limit=max_videos * 2)
 
@@ -1168,13 +1358,24 @@ def harvest_voice_from_youtube(
     candidates: list[RawAudioCandidate] = []
     collected_sec = 0.0
     for path in downloaded:
+        clip_out = clips_dir / Path(path).stem
+        # Resume support: clips already sliced by an earlier interrupted run are
+        # reused instead of being re-separated and re-sliced.
+        existing = load_sliced_candidates(clip_out)
+        if existing:
+            logger.info(f'♻️ [RESUME] Dùng lại {len(existing)} câu đã cắt cho {Path(path).stem}')
+            candidates.extend(existing)
+            collected_sec += sum(seg.duration_sec for seg in existing)
+            if collected_sec >= target_clean_sec:
+                break
+            continue
+
         try:
             vocal_wav, inst_wav = separate(Path(path), split_dir)
         except Exception as exc:  # separation is best-effort per video
             logger.error(f'❌ [UVR] Tách nhạc nền lỗi cho {path}: {exc}')
             continue
 
-        clip_out = clips_dir / Path(path).stem
         try:
             segments = slice_and_filter_segments(vocal_wav=vocal_wav, out_dir=clip_out, inst_wav=inst_wav)
         except Exception as exc:
@@ -1193,7 +1394,7 @@ def harvest_voice_from_youtube(
         voices_root=voices_root,
         transcribe_fn=transcribe,
         processed_video_ids=[Path(p).stem for p in downloaded],
-        min_word_prob=MIN_WORD_PROB,
+        min_word_prob=0.55 if transcribe_fn is None else MIN_WORD_PROB,
     )
     logger.info(
         f'🎉 [HARVEST] {voice_id}: {len(result.kept_clips)} câu / '
