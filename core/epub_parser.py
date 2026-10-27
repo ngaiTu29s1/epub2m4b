@@ -65,15 +65,16 @@ def parse_epub(epub_path: Path, workspace_dir: Path) -> BookMetadata:
             continue
         seen_ids.add(item_id)
         raw_html = item.get_content().decode('utf-8', errors='ignore')
-        chap_title, md = clean_html_to_markdown(raw_html, default_title=f'Chương {chap_idx}')
-        body_check = re.sub(r'^#.*$', '', md, flags=re.MULTILINE).strip()
-        if not body_check:
-            continue
-        enabled = not _is_boilerplate_chapter(chap_title, md)
-        chapters.append(
-            Chapter(index=chap_idx, title=chap_title, markdown=md, enabled=enabled)
-        )
-        chap_idx += 1
+        _, md = clean_html_to_markdown(raw_html, default_title=f'Chương {chap_idx}')
+        for sub in parse_book_markdown(md):
+            body_check = re.sub(r'^# .*$', '', sub.markdown, flags=re.MULTILINE).strip()
+            if not body_check:
+                continue
+            enabled = not _is_boilerplate_chapter(sub.title, sub.markdown)
+            chapters.append(
+                Chapter(index=chap_idx, title=sub.title, markdown=sub.markdown, enabled=enabled)
+            )
+            chap_idx += 1
 
     return BookMetadata(
         title=title,

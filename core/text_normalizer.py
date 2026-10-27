@@ -1,6 +1,19 @@
 import re
-from bs4 import BeautifulSoup
+import warnings
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from core.models import AudioSegmentSpec
+
+warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
+
+_CHAPTER_HEADING_RE = re.compile(
+    r'^(chương|phần|quyển|hồi|tập|mục|giới thiệu|lời mở đầu|lời nói đầu|'
+    r'phần dẫn|ngoại truyện|vĩ thanh|lời bạt|lời kết|prologue|epilogue|chapter|part|book)\b',
+    re.IGNORECASE,
+)
+_PARA_CHAPTER_RE = re.compile(
+    r'^(chương|hồi|quyển)\s+(?:\d+|[ivxlcdm]+)(?:\s*[:.\-–—]\s*.*)?$',
+    re.IGNORECASE,
+)
 
 _ROMAN_MAP = {
     'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
@@ -73,15 +86,19 @@ def clean_html_to_markdown(html: str, default_title: str = '') -> tuple[str, str
         else:
             a.unwrap()
 
-    title = default_title.strip()
-    heading = soup.find(['h1', 'h2', 'h3', 'title'])
-    if heading and heading.get_text(strip=True):
-        title = heading.get_text(' ', strip=True)
-        if heading.name in ('h1', 'h2', 'h3'):
-            heading.decompose()
-
-    blocks: list[str] = []
     body = soup.body or soup
+    heading_tags = [
+        h.name for h in body.find_all(['h1', 'h2', 'h3']) if h.get_text(strip=True)
+    ]
+    primary_heading_tag = None
+    for tag_name in ('h1', 'h2', 'h3'):
+        if tag_name in heading_tags:
+            primary_heading_tag = tag_name
+            break
+
+    first_title = ''
+    blocks: list[str] = []
+
     for elem in body.find_all(['h1', 'h2', 'h3', 'p', 'hr', 'blockquote', 'li', 'div']):
         if elem.name == 'div' and elem.find(['p', 'h1', 'h2', 'h3', 'blockquote', 'li']):
             continue
@@ -101,22 +118,42 @@ def clean_html_to_markdown(html: str, default_title: str = '') -> tuple[str, str
         if re.match(r'^(\*\s*){2,}$|^(-{3,})$', raw):
             blocks.append('---')
         elif elem.name in ('h1', 'h2', 'h3'):
-            if not title:
-                title = raw
-            elif raw != title:
+            is_chapter_heading = (
+                not first_title
+                or elem.name == primary_heading_tag
+                or bool(_CHAPTER_HEADING_RE.match(raw))
+            )
+            if is_chapter_heading:
+                if not first_title:
+                    first_title = raw
+                h1_line = f'# {raw}'
+                if not blocks or blocks[-1] != h1_line:
+                    blocks.append(h1_line)
+            else:
                 blocks.append(f'## {raw}')
+        elif (
+            len(raw) <= 80
+            and not raw.endswith(('.', '!', '?', ',', ';'))
+            and _PARA_CHAPTER_RE.match(raw)
+        ):
+            if not first_title:
+                first_title = raw
+            h1_line = f'# {raw}'
+            if not blocks or blocks[-1] != h1_line:
+                blocks.append(h1_line)
         else:
             blocks.append(raw)
 
-    if not blocks and not title:
-        fallback = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True)).strip()
+    if not blocks and not first_title:
+        fallback = re.sub(r'\s+', ' ', body.get_text(' ', strip=True)).strip()
         if fallback:
             blocks.append(fallback)
 
-    if not title:
-        title = default_title or 'Chương không tên'
+    title = first_title or default_title.strip() or 'Chương không tên'
+    if not blocks or not blocks[0].startswith('# '):
+        blocks.insert(0, f'# {title}')
 
-    md_lines = [f'# {title}', '']
+    md_lines: list[str] = []
     for b in blocks:
         md_lines.append(b)
         md_lines.append('')
