@@ -1,0 +1,366 @@
+import re
+import tempfile
+from pathlib import Path
+import gradio as gr
+from core.epub_parser import export_book_markdown, parse_book_markdown, parse_epub
+from core.m4b_packager import export_webvtt, package_m4b
+from core.models import BookMetadata, Chapter
+from core.text_normalizer import normalize_vi_text
+from core.tts_engine import (
+    ChapterAudioResult,
+    EdgeTTSEngine,
+    F5TTSEngine,
+    TTSEngine,
+    render_chapter,
+)
+
+DEFAULT_WORKSPACE = Path(__file__).resolve().parent / 'workspace'
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r'[^\w\s-]', '', text, flags=re.UNICODE).strip().lower()
+    slug = re.sub(r'[-\s]+', '_', slug)
+    return slug or 'audiobook'
+
+
+def _format_hms(ms: int) -> str:
+    total_sec = max(0, int(round(ms / 1000.0)))
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
+    return f'{h:02d}:{m:02d}:{s:02d}'
+
+
+def _chapter_label(ch: Chapter) -> str:
+    return f'[{ch.index:02d}] {ch.title}'
+
+
+def handle_epub_upload(epub_file: str | None, work_root: Path = DEFAULT_WORKSPACE):
+    if not epub_file:
+        return {}, '', '', None, gr.update(choices=[], value=[]), ''
+
+    epub_path = Path(epub_file)
+    book_dir = Path(work_root) / _slugify(epub_path.stem)
+    meta = parse_epub(epub_path, book_dir)
+
+    md_path = export_book_markdown(meta, book_dir / 'book.md')
+    md_text = md_path.read_text(encoding='utf-8')
+
+    choices = [_chapter_label(c) for c in meta.chapters]
+    selected = [_chapter_label(c) for c in meta.chapters if c.enabled]
+
+    state = {
+        'book_dir': str(book_dir),
+        'title': meta.title,
+        'author': meta.author,
+        'cover_path': str(meta.cover_path) if meta.cover_path else None,
+        'chapters': [
+            {
+                'index': c.index,
+                'title': c.title,
+                'markdown': c.markdown,
+                'enabled': c.enabled,
+                'label': _chapter_label(c),
+            }
+            for c in meta.chapters
+        ],
+    }
+    cover_val = str(meta.cover_path) if meta.cover_path and meta.cover_path.exists() else None
+    return (
+        state,
+        meta.title,
+        meta.author,
+        cover_val,
+        gr.update(choices=choices, value=selected),
+        md_text,
+    )
+
+
+def handle_chapter_selection(selected_labels: list[str], state: dict) -> str:
+    if not state or 'chapters' not in state:
+        return ''
+    selected_set = set(selected_labels or [])
+    enabled_mds: list[str] = []
+    for ch in state['chapters']:
+        ch['enabled'] = ch['label'] in selected_set
+        if ch['enabled'] and ch['markdown'].strip():
+            enabled_mds.append(ch['markdown'].strip())
+    return '\n\n'.join(enabled_mds) + ('\n' if enabled_mds else '')
+
+
+def _create_tts_engine(
+    engine_choice: str,
+    voice_choice: str,
+    rate_pct: int,
+    rvc_pth: str = '',
+    rvc_index: str = '',
+    f5_ref_audio: str | None = None,
+    f5_ref_text: str = '',
+) -> TTSEngine:
+    rate_str = f'{int(rate_pct):+d}%'
+    if 'F5-TTS' in engine_choice:
+        if not f5_ref_audio:
+            raise ValueError('Vui lòng tải lên file audio mẫu (10-15s) cho F5-TTS.')
+        return F5TTSEngine(ref_audio=Path(f5_ref_audio), ref_text=f5_ref_text)
+    if 'RVC' in engine_choice:
+        if not rvc_pth:
+            raise ValueError('Vui lòng nhập đường dẫn file model .pth cho chế độ Edge-TTS + RVC.')
+        return EdgeTTSEngine(
+            voice=voice_choice,
+            rate=rate_str,
+            rvc_model_path=Path(rvc_pth),
+            rvc_index_path=Path(rvc_index) if rvc_index else None,
+        )
+    return EdgeTTSEngine(voice=voice_choice, rate=rate_str)
+
+
+def handle_preview_tts(
+    sample_text: str,
+    engine_choice: str,
+    voice_choice: str,
+    rate_pct: int,
+    rvc_pth: str,
+    rvc_index: str,
+    f5_ref_audio: str | None,
+    f5_ref_text: str,
+) -> str | None:
+    cleaned = normalize_vi_text(sample_text or '')
+    if not cleaned:
+        return None
+    engine = _create_tts_engine(
+        engine_choice=engine_choice,
+        voice_choice=voice_choice,
+        rate_pct=rate_pct,
+        rvc_pth=rvc_pth,
+        rvc_index=rvc_index,
+        f5_ref_audio=f5_ref_audio,
+        f5_ref_text=f5_ref_text,
+    )
+    preview_dir = DEFAULT_WORKSPACE / '_preview'
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=preview_dir, suffix='.wav', delete=False) as tmp:
+        out_wav = Path(tmp.name)
+    engine.synthesize_segment(cleaned, out_wav)
+    return str(out_wav)
+
+
+def build_timeline_rows(results: list[ChapterAudioResult]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    offset_ms = 0
+    for r in results:
+        start_ms = offset_ms
+        end_ms = offset_ms + r.duration_ms
+        rows.append(
+            [
+                r.title,
+                _format_hms(start_ms),
+                _format_hms(end_ms),
+                _format_hms(r.duration_ms),
+            ]
+        )
+        offset_ms = end_ms
+    return rows
+
+
+def handle_generate_m4b(
+    state: dict,
+    book_title: str,
+    book_author: str,
+    md_text: str,
+    engine_choice: str,
+    voice_choice: str,
+    rate_pct: int,
+    rvc_pth: str,
+    rvc_index: str,
+    f5_ref_audio: str | None,
+    f5_ref_text: str,
+    force_rerender: bool = False,
+    progress=gr.Progress(),
+):
+    chapters = parse_book_markdown(md_text or '')
+    if not chapters:
+        raise ValueError('Kịch bản Markdown đang trống. Hãy tải file EPUB hoặc nhập nội dung # Chương.')
+
+    book_dir = Path((state or {}).get('book_dir') or (DEFAULT_WORKSPACE / _slugify(book_title)))
+    book_dir.mkdir(parents=True, exist_ok=True)
+    cover_str = (state or {}).get('cover_path')
+    cover_path = Path(cover_str) if cover_str and Path(cover_str).exists() else None
+
+    engine = _create_tts_engine(
+        engine_choice=engine_choice,
+        voice_choice=voice_choice,
+        rate_pct=rate_pct,
+        rvc_pth=rvc_pth,
+        rvc_index=rvc_index,
+        f5_ref_audio=f5_ref_audio,
+        f5_ref_text=f5_ref_text,
+    )
+
+    chaps_out_dir = book_dir / 'chapters_audio'
+    results: list[ChapterAudioResult] = []
+    total = len(chapters)
+    for idx, ch in enumerate(chapters, start=1):
+        progress((idx - 1) / max(1, total), desc=f'Đang tổng hợp ({idx}/{total}): {ch.title}')
+        res = render_chapter(ch, engine, chaps_out_dir, force=bool(force_rerender))
+        results.append(res)
+
+    progress(0.95, desc='Đang đóng gói .M4B & .VTT bằng FFmpeg...')
+    meta = BookMetadata(
+        title=book_title.strip() or 'Sách Nói',
+        author=book_author.strip() or 'Không rõ tác giả',
+        cover_path=cover_path,
+        chapters=chapters,
+    )
+    slug = _slugify(meta.title)
+    out_m4b = package_m4b(meta, results, book_dir / f'{slug}.m4b')
+    out_vtt = export_webvtt(results, book_dir / f'{slug}.vtt')
+    timeline_rows = build_timeline_rows(results)
+    total_dur = _format_hms(sum(r.duration_ms for r in results))
+    status = f'Hoàn tất {len(results)} chương — Tổng thời lượng: {total_dur} | File: {out_m4b.name}'
+    progress(1.0, desc='Hoàn tất!')
+    return str(out_m4b), str(out_m4b), str(out_vtt), timeline_rows, status
+
+
+def build_app() -> gr.Blocks:
+    with gr.Blocks(title='EPUB to M4B Studio (Vietnamese AI Audiobook)') as demo:
+        state = gr.State({})
+
+        gr.Markdown(
+            '# 🎧 EPUB to M4B Audiobook Studio\n'
+            'Chuyển đổi sách `.epub` Tiếng Việt sang `.m4b` có Chapter Timeline & phụ đề `.vtt` cho **Audiobookshelf**.'
+        )
+
+        # KHU VỰC 1
+        with gr.Group():
+            gr.Markdown('### 1. Tải sách `.epub` & Hiệu đính kịch bản Clean Markdown (`.md`)')
+            with gr.Row():
+                with gr.Column(scale=1):
+                    epub_input = gr.File(label='Kéo thả file .epub vào đây', file_types=['.epub'])
+                    cover_preview = gr.Image(label='Ảnh bìa sách', type='filepath', height=220)
+                    book_title = gr.Textbox(label='Tên sách')
+                    book_author = gr.Textbox(label='Tác giả')
+                    chapter_selector = gr.CheckboxGroup(
+                        label='Danh sách chương (Bỏ tích chương Mục lục / Bản quyền)',
+                        choices=[],
+                        value=[],
+                    )
+                with gr.Column(scale=2):
+                    md_editor = gr.Textbox(
+                        label='Clean Markdown (.md) — # Tên chương | --- Nghỉ chuyển cảnh (1.5s)',
+                        lines=24,
+                        placeholder='# Chương 1: Khởi đầu\n\nNội dung chương sách...',
+                    )
+
+        # KHU VỰC 2
+        with gr.Group():
+            gr.Markdown('### 2. Cấu hình Giọng đọc (TTS Engine) & Nghe thử (Preview)')
+            with gr.Row():
+                engine_choice = gr.Radio(
+                    label='Chế độ Engine',
+                    choices=[
+                        'Edge-TTS (Siêu nhanh)',
+                        'Edge-TTS + RVC (Đổi màu giọng RTX 3060)',
+                        'F5-TTS Clone (Nhân bản giọng RTX 3060)',
+                    ],
+                    value='Edge-TTS (Siêu nhanh)',
+                )
+                voice_choice = gr.Dropdown(
+                    label='Giọng đọc cơ sở (Microsoft Edge Neural)',
+                    choices=['vi-VN-NamMinhNeural', 'vi-VN-HoaiMyNeural'],
+                    value='vi-VN-NamMinhNeural',
+                )
+                rate_slider = gr.Slider(
+                    label='Tốc độ đọc (%)',
+                    minimum=-30,
+                    maximum=50,
+                    step=5,
+                    value=0,
+                )
+
+            with gr.Accordion('Cấu hình nâng cao (RVC v2 / F5-TTS GPU RTX 3060)', open=False):
+                with gr.Row():
+                    rvc_pth = gr.Textbox(label='Đường dẫn model RVC (.pth)', placeholder='/path/to/voice.pth')
+                    rvc_index = gr.Textbox(label='Đường dẫn file RVC (.index)', placeholder='/path/to/voice.index')
+                with gr.Row():
+                    f5_ref_audio = gr.Audio(label='Audio mẫu F5-TTS (10–15s)', type='filepath')
+                    f5_ref_text = gr.Textbox(label='Transcript khớp với Audio mẫu F5-TTS')
+
+            with gr.Row():
+                preview_text = gr.Textbox(
+                    label='Câu văn đọc thử',
+                    value='Chương IV: Ngày 19/05/1990 tại TP.HCM, những cơn mưa đầu mùa bắt đầu rơi.',
+                    scale=3,
+                )
+                preview_btn = gr.Button('🔊 Đọc thử (Preview)', variant='secondary', scale=1)
+                preview_audio = gr.Audio(label='Âm thanh đọc thử', type='filepath', scale=2)
+
+        # KHU VỰC 3
+        with gr.Group():
+            gr.Markdown('### 3. Đóng gói `.M4B` & Bảng Chapter Timeline')
+            with gr.Row():
+                force_checkbox = gr.Checkbox(
+                    label='Render lại toàn bộ (bỏ qua cache các chương đã xong)',
+                    value=False,
+                )
+                generate_btn = gr.Button('🚀 Tạo Sách Nói (.M4B)', variant='primary')
+
+            status_box = gr.Textbox(label='Trạng thái xử lý', interactive=False)
+            timeline_table = gr.Dataframe(
+                headers=['Chương', 'Bắt đầu', 'Kết thúc', 'Thời lượng'],
+                datatype=['str', 'str', 'str', 'str'],
+                label='Chapter Timeline (FFMETADATA)',
+                interactive=False,
+            )
+            with gr.Row():
+                m4b_player = gr.Audio(label='Nghe sách nói (.m4b)', type='filepath')
+                m4b_download = gr.File(label='Tải về .M4B (Audiobookshelf)')
+                vtt_download = gr.File(label='Tải về phụ đề .VTT (WebVTT)')
+
+        epub_input.change(
+            fn=handle_epub_upload,
+            inputs=[epub_input],
+            outputs=[state, book_title, book_author, cover_preview, chapter_selector, md_editor],
+        )
+        chapter_selector.change(
+            fn=handle_chapter_selection,
+            inputs=[chapter_selector, state],
+            outputs=[md_editor],
+        )
+        preview_btn.click(
+            fn=handle_preview_tts,
+            inputs=[
+                preview_text,
+                engine_choice,
+                voice_choice,
+                rate_slider,
+                rvc_pth,
+                rvc_index,
+                f5_ref_audio,
+                f5_ref_text,
+            ],
+            outputs=[preview_audio],
+        )
+        generate_btn.click(
+            fn=handle_generate_m4b,
+            inputs=[
+                state,
+                book_title,
+                book_author,
+                md_editor,
+                engine_choice,
+                voice_choice,
+                rate_slider,
+                rvc_pth,
+                rvc_index,
+                f5_ref_audio,
+                f5_ref_text,
+                force_checkbox,
+            ],
+            outputs=[m4b_player, m4b_download, vtt_download, timeline_table, status_box],
+        )
+
+    return demo
+
+
+if __name__ == '__main__':
+    app_instance = build_app()
+    app_instance.launch(server_name='0.0.0.0', server_port=7860)
