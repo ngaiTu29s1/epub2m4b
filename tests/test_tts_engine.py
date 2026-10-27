@@ -1,0 +1,34 @@
+import wave
+from pathlib import Path
+from core.models import Chapter
+from core.tts_engine import TTSEngine, render_chapter
+
+
+class DummyTTSEngine(TTSEngine):
+    def __init__(self):
+        self.calls = 0
+
+    def synthesize_segment(self, text: str, out_wav: Path) -> int:
+        self.calls += 1
+        sr = 24000
+        n_frames = sr // 2  # 500ms
+        with wave.open(str(out_wav), 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(b'\x00\x00' * n_frames)
+        return 500
+
+
+def test_render_chapter_stitches_pauses_and_caches_checkpoint(tmp_path: Path):
+    chap = Chapter(index=1, title='Chương 1', markdown='# Chương 1\n\nCâu đầu tiên.\n\nCâu thứ hai.')
+    engine = DummyTTSEngine()
+    res1 = render_chapter(chap, engine, tmp_path)
+    assert res1.audio_path.exists()
+    assert res1.duration_ms >= 3500
+    assert len(res1.cues) == 3
+    calls_after_first = engine.calls
+
+    res2 = render_chapter(chap, engine, tmp_path, force=False)
+    assert engine.calls == calls_after_first
+    assert res2.duration_ms == res1.duration_ms
