@@ -1,0 +1,34 @@
+[project]
+name = "epub2m4b"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "ngaiTu29s1", email = "trantuantu2004@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "ebooklib>=0.20",
+    "edge-tts>=7.3.1",
+    "gradio>=6.30.0",
+    "lxml>=6.1.3",
+    "numpy>=2.5.4",
+    "soundfile>=0.14.0",
+    "static-ffmpeg>=3.0",
+]
+
+[project.scripts]
+epub2m4b = "epub2m4b:main"
+
+[build-system]
+requires = ["uv_build>=0.13.6,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ['.']
