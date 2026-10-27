@@ -89,9 +89,16 @@ epub2m4b/
 ```
 
 ### 3. Khởi động Web UI Studio
-```bash
-.venv/bin/python app.py
-```
+- **Chạy bình thường:**
+  ```bash
+  uv run python app.py
+  ```
+- **Chạy chế độ Watch (tự động reload khi sửa code `app.py` hoặc `core/`):**
+  ```bash
+  uv run python app.py --watch
+  # hoặc dùng gradio CLI:
+  uv run gradio app.py
+  ```
 Mở trình duyệt tại địa chỉ: **`http://localhost:7860`**
 
 ---

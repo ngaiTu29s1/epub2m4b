@@ -361,6 +361,21 @@ def build_app() -> gr.Blocks:
     return demo
 
 
+demo = build_app()
+
+
 if __name__ == '__main__':
-    app_instance = build_app()
-    app_instance.launch(server_name='0.0.0.0', server_port=7860)
+    import os
+    import sys
+
+    port = int(os.getenv('GRADIO_SERVER_PORT', '7860'))
+    host = os.getenv('GRADIO_SERVER_NAME', '0.0.0.0')
+
+    if '--watch' in sys.argv or '-w' in sys.argv:
+        from gradio.cli.commands.reload import main as reload_main
+
+        clean_args = [arg for arg in sys.argv[1:] if arg not in ('--watch', '-w')]
+        reload_main(demo_path=Path(__file__), watch_dirs=['core'], app_args=clean_args)
+    else:
+        demo.launch(server_name=host, server_port=port)
+
