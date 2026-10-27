@@ -76,3 +76,24 @@ def test_gradio_app_builds_and_handles_pipeline(tmp_path: Path, monkeypatch):
     assert len(timeline_rows) == 1
     assert timeline_rows[0][0] == 'Chương I: Khởi Đầu'
     assert 'Hoàn tất' in status_msg
+
+
+def test_select_and_deselect_all_chapters():
+    state = {
+        'chapters': [
+            {'index': 1, 'label': '[01] Chương 1', 'markdown': '# Chương 1\nNội dung 1', 'enabled': False},
+            {'index': 2, 'label': '[02] Chương 2', 'markdown': '# Chương 2\nNội dung 2', 'enabled': True},
+        ]
+    }
+    # Test Deselect All
+    update_desel, md_desel = app.handle_deselect_all_chapters(state)
+    assert update_desel['value'] == []
+    assert md_desel == ''
+    assert all(not ch['enabled'] for ch in state['chapters'])
+
+    # Test Select All
+    update_sel, md_sel = app.handle_select_all_chapters(state)
+    assert update_sel['value'] == ['[01] Chương 1', '[02] Chương 2']
+    assert '# Chương 1' in md_sel and '# Chương 2' in md_sel
+    assert all(ch['enabled'] for ch in state['chapters'])
+

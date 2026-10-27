@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -10,6 +11,8 @@ from pathlib import Path
 import edge_tts
 from core.models import Chapter
 from core.text_normalizer import markdown_to_segments
+
+logger = logging.getLogger('epub2m4b.tts')
 
 SAMPLE_RATE = 24000
 
@@ -73,12 +76,22 @@ class EdgeTTSEngine(TTSEngine):
                 last_exc = exc
                 if attempt == max_retries - 1:
                     break
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    f'⚠️ [RETRY] Edge-TTS gặp lỗi NoAudioReceived (thử lại {attempt + 1}/{max_retries}) '
+                    f'sau {delay:.1f}s...'
+                )
+                await asyncio.sleep(delay)
             except Exception as exc:
                 last_exc = exc
                 if attempt == max_retries - 1:
                     break
-                await asyncio.sleep(0.5 * (2 ** attempt))
+                delay = 0.5 * (2 ** attempt)
+                logger.warning(
+                    f'⚠️ [RETRY] Edge-TTS gặp ngoại lệ ({type(exc).__name__}: {exc}) '
+                    f'thử lại {attempt + 1}/{max_retries} sau {delay:.1f}s...'
+                )
+                await asyncio.sleep(delay)
         if last_exc:
             raise last_exc
 
@@ -189,6 +202,10 @@ def render_chapter(
     if not force and wav_path.exists() and meta_path.exists():
         data = json.loads(meta_path.read_text(encoding='utf-8'))
         cues = [SubtitleCue(**c) for c in data['cues']]
+        logger.info(
+            f'⚡ [CACHE] Chương {chapter.index:03d} "{chapter.title}" đã có cache audio '
+            f'({data["duration_ms"] / 1000:.1f}s), bỏ qua render.'
+        )
         return ChapterAudioResult(
             chapter_index=chapter.index,
             title=data['title'],
@@ -200,6 +217,9 @@ def render_chapter(
     segments = markdown_to_segments(chapter.markdown)
     cues: list[SubtitleCue] = []
     current_ms = 0
+    logger.info(
+        f'🎙️ [TTS] Chương {chapter.index:03d} "{chapter.title}": Bắt đầu render {len(segments)} phân đoạn...'
+    )
 
     with tempfile.TemporaryDirectory() as tmpd:
         tmp_dir = Path(tmpd)
@@ -235,6 +255,10 @@ def render_chapter(
         'cues': [asdict(c) for c in cues],
     }
     meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    logger.info(
+        f'✔️ [TTS] Chương {chapter.index:03d} "{chapter.title}" hoàn thành '
+        f'({current_ms / 1000:.1f}s, {len(cues)} cues).'
+    )
 
     return ChapterAudioResult(
         chapter_index=chapter.index,

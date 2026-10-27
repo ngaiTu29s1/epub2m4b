@@ -1,3 +1,4 @@
+import logging
 import re
 import tempfile
 from pathlib import Path
@@ -13,6 +14,13 @@ from core.tts_engine import (
     TTSEngine,
     render_chapter,
 )
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger('epub2m4b')
 
 DEFAULT_WORKSPACE = Path(__file__).resolve().parent / 'workspace'
 
@@ -39,14 +47,18 @@ def handle_epub_upload(epub_file: str | None, work_root: Path = DEFAULT_WORKSPAC
         return {}, '', '', None, gr.update(choices=[], value=[]), ''
 
     epub_path = Path(epub_file)
+    logger.info(f'📂 [UPLOAD] Nhận file EPUB: {epub_path.name}')
     book_dir = Path(work_root) / _slugify(epub_path.stem)
     meta = parse_epub(epub_path, book_dir)
+    logger.info(f'📖 [METADATA] Tên sách: "{meta.title}" | Tác giả: "{meta.author}"')
 
     md_path = export_book_markdown(meta, book_dir / 'book.md')
     md_text = md_path.read_text(encoding='utf-8')
+    logger.info(f'📑 [PARSER] Tách thành công {len(meta.chapters)} chương | Kịch bản lưu tại: {md_path.name}')
 
     choices = [_chapter_label(c) for c in meta.chapters]
     selected = [_chapter_label(c) for c in meta.chapters if c.enabled]
+    logger.info(f'🎯 [SELECT] Mặc định chọn {len(selected)}/{len(choices)} chương (đã lọc mục lục/bản quyền/trang rác)')
 
     state = {
         'book_dir': str(book_dir),
@@ -75,6 +87,27 @@ def handle_epub_upload(epub_file: str | None, work_root: Path = DEFAULT_WORKSPAC
     )
 
 
+def handle_select_all_chapters(state: dict):
+    if not state or 'chapters' not in state:
+        return gr.update(value=[]), ''
+    all_labels = [ch['label'] for ch in state['chapters']]
+    for ch in state['chapters']:
+        ch['enabled'] = True
+    enabled_mds = [ch['markdown'].strip() for ch in state['chapters'] if ch['markdown'].strip()]
+    md_text = '\n\n'.join(enabled_mds) + ('\n' if enabled_mds else '')
+    logger.info(f'✅ [SELECT_ALL] Đã tích chọn toàn bộ {len(all_labels)} chương.')
+    return gr.update(value=all_labels), md_text
+
+
+def handle_deselect_all_chapters(state: dict):
+    if not state or 'chapters' not in state:
+        return gr.update(value=[]), ''
+    for ch in state['chapters']:
+        ch['enabled'] = False
+    logger.info('❌ [DESELECT_ALL] Đã bỏ tích toàn bộ chương.')
+    return gr.update(value=[]), ''
+
+
 def handle_chapter_selection(selected_labels: list[str], state: dict) -> str:
     if not state or 'chapters' not in state:
         return ''
@@ -84,6 +117,7 @@ def handle_chapter_selection(selected_labels: list[str], state: dict) -> str:
         ch['enabled'] = ch['label'] in selected_set
         if ch['enabled'] and ch['markdown'].strip():
             enabled_mds.append(ch['markdown'].strip())
+    logger.info(f'🔘 [SELECTION] Thay đổi lựa chọn: {len(selected_set)}/{len(state["chapters"])} chương được chọn.')
     return '\n\n'.join(enabled_mds) + ('\n' if enabled_mds else '')
 
 
@@ -126,6 +160,7 @@ def handle_preview_tts(
     cleaned = normalize_vi_text(sample_text or '')
     if not cleaned:
         return None
+    logger.info(f'🔊 [PREVIEW] Thử giọng {engine_choice} ({voice_choice}, {rate_pct:+d}%): "{cleaned[:60]}..."')
     engine = _create_tts_engine(
         engine_choice=engine_choice,
         voice_choice=voice_choice,
@@ -140,6 +175,7 @@ def handle_preview_tts(
     with tempfile.NamedTemporaryFile(dir=preview_dir, suffix='.wav', delete=False) as tmp:
         out_wav = Path(tmp.name)
     engine.synthesize_segment(cleaned, out_wav)
+    logger.info(f'✔️ [PREVIEW] Hoàn tất đoạn nghe thử: {out_wav}')
     return str(out_wav)
 
 
@@ -178,12 +214,19 @@ def handle_generate_m4b(
 ):
     chapters = parse_book_markdown(md_text or '')
     if not chapters:
+        logger.error('❌ [ERROR] Kịch bản Markdown đang trống.')
         raise ValueError('Kịch bản Markdown đang trống. Hãy tải file EPUB hoặc nhập nội dung # Chương.')
 
     book_dir = Path((state or {}).get('book_dir') or (DEFAULT_WORKSPACE / _slugify(book_title)))
     book_dir.mkdir(parents=True, exist_ok=True)
     cover_str = (state or {}).get('cover_path')
     cover_path = Path(cover_str) if cover_str and Path(cover_str).exists() else None
+
+    logger.info('==================================================')
+    logger.info(f'🚀 [START] Bắt đầu tạo sách nói: "{book_title}" — Tác giả: "{book_author}"')
+    logger.info(f'⚙️ [CONFIG] Engine: {engine_choice} | Giọng: {voice_choice} | Tốc độ: {rate_pct:+d}%')
+    logger.info(f'📚 [CHAPTERS] Tổng số chương cần tổng hợp audio: {len(chapters)}')
+    logger.info('==================================================')
 
     engine = _create_tts_engine(
         engine_choice=engine_choice,
@@ -200,10 +243,13 @@ def handle_generate_m4b(
     total = len(chapters)
     for idx, ch in enumerate(chapters, start=1):
         progress((idx - 1) / max(1, total), desc=f'Đang tổng hợp ({idx}/{total}): {ch.title}')
+        logger.info(f'⏳ [{idx}/{total}] Đang xử lý: "{ch.title}" ...')
         res = render_chapter(ch, engine, chaps_out_dir, force=bool(force_rerender))
         results.append(res)
+        logger.info(f'✔️ [{idx}/{total}] Xong "{ch.title}" ({res.duration_ms / 1000:.1f}s, {len(res.cues)} cues)')
 
     progress(0.95, desc='Đang đóng gói .M4B & .VTT bằng FFmpeg...')
+    logger.info('📦 [PACKAGING] Đang đóng gói .M4B và .VTT bằng FFmpeg...')
     meta = BookMetadata(
         title=book_title.strip() or 'Sách Nói',
         author=book_author.strip() or 'Không rõ tác giả',
@@ -216,6 +262,10 @@ def handle_generate_m4b(
     timeline_rows = build_timeline_rows(results)
     total_dur = _format_hms(sum(r.duration_ms for r in results))
     status = f'Hoàn tất {len(results)} chương — Tổng thời lượng: {total_dur} | File: {out_m4b.name}'
+    logger.info(f'🎉 [SUCCESS] {status}')
+    logger.info(f'📁 [OUTPUT] Sách nói M4B: {out_m4b}')
+    logger.info(f'📁 [OUTPUT] Phụ đề WebVTT: {out_vtt}')
+    logger.info('==================================================')
     progress(1.0, desc='Hoàn tất!')
     return str(out_m4b), str(out_m4b), str(out_vtt), timeline_rows, status
 
@@ -238,6 +288,9 @@ def build_app() -> gr.Blocks:
                     cover_preview = gr.Image(label='Ảnh bìa sách', type='filepath', height=220)
                     book_title = gr.Textbox(label='Tên sách')
                     book_author = gr.Textbox(label='Tác giả')
+                    with gr.Row():
+                        select_all_btn = gr.Button('✅ Chọn tất cả', size='sm', variant='secondary')
+                        deselect_all_btn = gr.Button('❌ Bỏ chọn tất cả', size='sm', variant='secondary')
                     chapter_selector = gr.CheckboxGroup(
                         label='Danh sách chương (Bỏ tích chương Mục lục / Bản quyền)',
                         choices=[],
@@ -324,6 +377,16 @@ def build_app() -> gr.Blocks:
             fn=handle_chapter_selection,
             inputs=[chapter_selector, state],
             outputs=[md_editor],
+        )
+        select_all_btn.click(
+            fn=handle_select_all_chapters,
+            inputs=[state],
+            outputs=[chapter_selector, md_editor],
+        )
+        deselect_all_btn.click(
+            fn=handle_deselect_all_chapters,
+            inputs=[state],
+            outputs=[chapter_selector, md_editor],
         )
         preview_btn.click(
             fn=handle_preview_tts,
