@@ -5,6 +5,7 @@ __pycache__/
 .superpowers/
 workspace/
 models/
+voices/
 *.m4b
 *.wav
 *.vtt
