@@ -149,6 +149,63 @@ class EdgeTTSEngine(TTSEngine):
         tmp_out.unlink(missing_ok=True)
 
 
+_F5_CACHE: dict = {}
+
+
+def _get_f5_resources(ckpt_path: Path | None = None):
+    key = str(ckpt_path) if ckpt_path else 'default'
+    if key in _F5_CACHE:
+        return _F5_CACHE[key]
+
+    import soundfile as sf
+    import torch
+    import torchaudio
+    from huggingface_hub import hf_hub_download
+
+    def sf_load(uri, *args, **kwargs):
+        data, sr = sf.read(str(uri), dtype='float32')
+        t = torch.from_numpy(data)
+        if t.ndim == 1:
+            t = t.unsqueeze(0)
+        else:
+            t = t.t()
+        return t, sr
+
+    def sf_save(uri, src, sample_rate, *args, **kwargs):
+        arr = src.detach().cpu().numpy()
+        if arr.ndim == 2:
+            arr = arr.T
+        sf.write(str(uri), arr, sample_rate)
+
+    torchaudio.load = sf_load
+    torchaudio.save = sf_save
+
+    from f5_tts.infer.utils_infer import load_model, load_vocoder
+    from f5_tts.model import DiT
+
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+    vocoder = load_vocoder(is_local=False)
+    model_cls = DiT
+    model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
+    if ckpt_path and Path(ckpt_path).exists():
+        real_ckpt = str(ckpt_path)
+    else:
+        real_ckpt = hf_hub_download(
+            repo_id='SWivid/F5-TTS', filename='F5TTS_v1_Base/model_1250000.safetensors'
+        )
+
+    model = load_model(model_cls, model_cfg, ckpt_path=real_ckpt, device=device)
+    _F5_CACHE[key] = (model, vocoder, device)
+    return _F5_CACHE[key]
+
+
+def _get_f5_cli() -> str | None:
+    venv_cli = Path(__file__).resolve().parent.parent / '.venv' / 'bin' / 'f5-tts_infer-cli'
+    if venv_cli.exists():
+        return str(venv_cli)
+    return shutil.which('f5-tts_infer-cli')
+
+
 class F5TTSEngine(TTSEngine):
     def __init__(self, ref_audio: Path, ref_text: str, ckpt_path: Path | None = None):
         self.ref_audio = Path(ref_audio)
@@ -156,36 +213,77 @@ class F5TTSEngine(TTSEngine):
         self.ckpt_path = Path(ckpt_path) if ckpt_path else None
 
     def synthesize_segment(self, text: str, out_wav: Path) -> int:
-        cli = shutil.which('f5-tts_infer-cli')
-        if not cli:
-            raise RuntimeError(
-                'Chưa tìm thấy f5-tts_infer-cli. Hãy cài f5-tts để chạy Voice Cloning trên GPU 3060.'
+        out_wav = Path(out_wav)
+        out_wav.parent.mkdir(parents=True, exist_ok=True)
+        if not re.search(r'\w', text):
+            with wave.open(str(out_wav), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(b'\x00\x00' * int(SAMPLE_RATE * 0.2))
+            return 200
+
+        try:
+            import soundfile as sf
+            from f5_tts.infer.utils_infer import infer_process
+
+            model, vocoder, device = _get_f5_resources(self.ckpt_path)
+            wav, sr, _ = infer_process(
+                ref_audio=str(self.ref_audio),
+                ref_text=self.ref_text,
+                gen_text=text,
+                model_obj=model,
+                vocoder=vocoder,
+                mel_spec_type='vocos',
+                device=device,
             )
-        with tempfile.TemporaryDirectory() as tmpd:
-            cmd = [
-                cli,
-                '--ref_audio', str(self.ref_audio),
-                '--ref_text', self.ref_text,
-                '--gen_text', text,
-                '--output_dir', tmpd,
-            ]
-            if self.ckpt_path and self.ckpt_path.exists():
-                cmd.extend(['--ckpt_file', str(self.ckpt_path)])
-            subprocess.run(cmd, check=True)
-            generated = list(Path(tmpd).glob('*.wav'))
-            if not generated:
-                raise RuntimeError('F5-TTS không sinh ra file wav.')
-            ffmpeg_bin = _get_ffmpeg_bin()
-            subprocess.run(
-                [
-                    ffmpeg_bin, '-y', '-v', 'error',
-                    '-i', str(generated[0]),
-                    '-ac', '1', '-ar', str(SAMPLE_RATE), '-sample_fmt', 's16',
-                    str(out_wav),
-                ],
-                check=True,
-            )
-        return _wav_duration_ms(out_wav)
+            with tempfile.TemporaryDirectory() as tmpd:
+                raw_wav = Path(tmpd) / 'raw.wav'
+                sf.write(str(raw_wav), wav, sr)
+                ffmpeg_bin = _get_ffmpeg_bin()
+                subprocess.run(
+                    [
+                        ffmpeg_bin, '-y', '-v', 'error',
+                        '-i', str(raw_wav),
+                        '-ac', '1', '-ar', str(SAMPLE_RATE), '-sample_fmt', 's16',
+                        str(out_wav),
+                    ],
+                    check=True,
+                )
+            return _wav_duration_ms(out_wav)
+        except Exception as exc:
+            logger.warning(f'⚠️ [F5-TTS] In-process inference gặp lỗi ({exc}), chuyển sang CLI fallback...')
+            cli = _get_f5_cli()
+            if not cli:
+                raise RuntimeError(
+                    f'F5-TTS inference thất bại: {exc}. Hãy kiểm tra cấu hình F5-TTS.'
+                ) from exc
+
+            with tempfile.TemporaryDirectory() as tmpd:
+                cmd = [
+                    cli,
+                    '--ref_audio', str(self.ref_audio),
+                    '--ref_text', self.ref_text,
+                    '--gen_text', text,
+                    '--output_dir', tmpd,
+                ]
+                if self.ckpt_path and self.ckpt_path.exists():
+                    cmd.extend(['--ckpt_file', str(self.ckpt_path)])
+                subprocess.run(cmd, check=True)
+                generated = list(Path(tmpd).glob('*.wav'))
+                if not generated:
+                    raise RuntimeError('F5-TTS không sinh ra file wav.')
+                ffmpeg_bin = _get_ffmpeg_bin()
+                subprocess.run(
+                    [
+                        ffmpeg_bin, '-y', '-v', 'error',
+                        '-i', str(generated[0]),
+                        '-ac', '1', '-ar', str(SAMPLE_RATE), '-sample_fmt', 's16',
+                        str(out_wav),
+                    ],
+                    check=True,
+                )
+            return _wav_duration_ms(out_wav)
 
 
 def render_chapter(
