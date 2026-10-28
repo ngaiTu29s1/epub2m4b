@@ -747,6 +747,8 @@ class RVCVoiceConverter:
         self.index_rate = float(index_rate)
         self.f0_method = f0_method
         self.speaker_id = speaker_id
+        self.pitch_shift = 1.5  # semitones up to align NamMinh (~144Hz) with VuiVe (~160Hz)
+        self.protect = 0.33     # consonant protection rate
         self.device = device or ('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.index = None
         self._big_npy = None
@@ -845,14 +847,15 @@ class RVCVoiceConverter:
         return torch.from_numpy(o_npy).transpose(0, 1).unsqueeze(0).to(self.device)
 
     def _extract_f0(self, audio, sr):
-        """F0 (Hz) at RVC's 100 Hz frame grid over the 16 kHz signal."""
+        """F0 (Hz) at RVC's 100 Hz frame grid (hop 160 = 10 ms @ 16 kHz)."""
         import numpy as np
         import librosa
 
         audio = np.asarray(audio, dtype=np.float32)
         if sr != RVC_FEATURE_SR:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=RVC_FEATURE_SR)
-        hop = RVC_WINDOW * 2  # 320 samples @16k = 20 ms == ContentVec frame rate
+        # RVC expects 100 Hz frame rate (window=160 samples @ 16 kHz = 10 ms)
+        hop = 160
         f0, _, _ = librosa.pyin(
             audio,
             fmin=RVC_F0_MIN,
@@ -862,6 +865,9 @@ class RVCVoiceConverter:
             hop_length=hop,
         )
         f0 = np.nan_to_num(np.asarray(f0, dtype=np.float32))
+        pitch_shift = getattr(self, 'pitch_shift', 0.0)
+        if pitch_shift != 0:
+            f0 *= pow(2, pitch_shift / 12)
         return self._coarse_f0(f0), f0
 
     @staticmethod
@@ -883,14 +889,35 @@ class RVCVoiceConverter:
     def _run_net(self, feats, pitch, pitchf, sid):
         import numpy as np
         import torch
+        import torch.nn.functional as F
 
-        net = self._load_net()
-        phone = feats.to(self.device)
-        p_len = min(phone.shape[2], pitch.shape[0], pitchf.shape[0])
-        phone = phone[:, :, :p_len]
+        # feats shape: (1, 768, T_feat) at 50 Hz from ContentVec
+        # RVC standard pipeline interpolates features by 2x to match 100 Hz F0 grid!
+        feats_raw = feats.clone()
+        if self.index is not None and self.index_rate > 0:
+            feats_retrieved = self._retrieve(feats)
+        else:
+            feats_retrieved = feats
+
+        feats_interp = F.interpolate(feats_retrieved, scale_factor=2, mode='nearest')
+        feats_raw_interp = F.interpolate(feats_raw, scale_factor=2, mode='nearest')
+
+        p_len = min(feats_interp.shape[2], pitch.shape[0], pitchf.shape[0])
         pitch_t = torch.from_numpy(pitch[:p_len]).unsqueeze(0).long().to(self.device)
         pitchf_t = torch.from_numpy(pitchf[:p_len]).unsqueeze(0).float().to(self.device)
+
+        # RVC Protect mechanism: keep unvoiced frames (pitchf == 0) close to source
+        # to prevent consonant blur/slurring while morphing vowels to target speaker
+        protect = getattr(self, 'protect', 0.33)
+        if protect < 0.5:
+            mask = (pitchf_t > 0).float()
+            weight = mask + (1.0 - mask) * protect
+            phone = feats_interp[:, :, :p_len] * weight.unsqueeze(1) + feats_raw_interp[:, :, :p_len] * (1.0 - weight).unsqueeze(1)
+        else:
+            phone = feats_interp[:, :, :p_len]
+
         sid_t = torch.LongTensor([sid]).to(self.device)
+        net = self._load_net()
         with torch.no_grad():
             o, _, _ = net.infer(phone, None, pitch_t, pitchf_t, sid_t)
         return o.squeeze().cpu().numpy().astype(np.float32)
