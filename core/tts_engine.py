@@ -59,11 +59,16 @@ class EdgeTTSEngine(TTSEngine):
         rate: str = '+0%',
         rvc_model_path: Path | None = None,
         rvc_index_path: Path | None = None,
+        rvc_index_rate: float = 0.75,
+        rvc_speaker_id: int = 0,
     ):
         self.voice = voice
         self.rate = rate
         self.rvc_model_path = Path(rvc_model_path) if rvc_model_path else None
         self.rvc_index_path = Path(rvc_index_path) if rvc_index_path else None
+        self.rvc_index_rate = float(rvc_index_rate)
+        self.rvc_speaker_id = int(rvc_speaker_id)
+        self._rvc_converter = None
 
     async def _save_mp3(self, text: str, mp3_path: Path, max_retries: int = 5) -> None:
         last_exc: Exception | None = None
@@ -126,30 +131,62 @@ class EdgeTTSEngine(TTSEngine):
         return _wav_duration_ms(out_wav)
 
     def _apply_rvc(self, wav_path: Path) -> None:
-        try:
-            from rvc_python.infer import RVCInference
-        except ImportError as exc:
-            raise RuntimeError(
-                'Cần cài thêm rvc-python trong venv để chạy chế độ Edge-TTS + RVC.'
-            ) from exc
-        rvc = RVCInference(device='cuda:0')
-        rvc.load_model(str(self.rvc_model_path), index_path=str(self.rvc_index_path or ''))
-        tmp_out = wav_path.with_suffix('.rvc.wav')
-        rvc.infer_file(str(wav_path), str(tmp_out))
-        ffmpeg_bin = _get_ffmpeg_bin()
-        subprocess.run(
-            [
-                ffmpeg_bin, '-y', '-v', 'error',
-                '-i', str(tmp_out),
-                '-ac', '1', '-ar', str(SAMPLE_RATE), '-sample_fmt', 's16',
-                str(wav_path),
-            ],
-            check=True,
+        from core.rvc_engine import RVCVoiceConverter, convert_wav_to_24k
+
+        converter = self._get_rvc_converter()
+        tmp_out = wav_path.with_suffix('.rvc24.wav')
+        convert_wav_to_24k(wav_path, tmp_out, converter)
+        tmp_out.replace(wav_path)
+
+    def _get_rvc_converter(self):
+        """Lazily build (and cache) the pure-PyTorch RVC v2 converter."""
+        converter = getattr(self, '_rvc_converter', None)
+        if converter is not None:
+            return converter
+        from core.rvc_engine import RVCVoiceConverter
+
+        converter = RVCVoiceConverter(
+            model_path=self.rvc_model_path,
+            index_path=self.rvc_index_path,
+            index_rate=self.rvc_index_rate,
+            speaker_id=self.rvc_speaker_id,
         )
-        tmp_out.unlink(missing_ok=True)
+        self._rvc_converter = converter
+        return converter
 
 
 _F5_CACHE: dict = {}
+
+# The base SWivid/F5-TTS checkpoint is trained on EN-ZH: its pinyin vocab has no
+# Vietnamese syllables, so Vietnamese text tokenizes to unknown chars and comes
+# out garbled/lisping. `toandev/F5-TTS-Vietnamese` is a Vietnamese fine-tune
+# whose char-level vocab.txt covers all 47 Vietnamese diacritics.
+F5_VIETNAMESE_REPO = 'toandev/F5-TTS-Vietnamese'
+F5_VIETNAMESE_CKPT_FILE = 'model_latest.safetensors'
+F5_VIETNAMESE_VOCAB_FILE = 'vocab.txt'
+
+
+def _resolve_f5_ckpt() -> str:
+    """Path to the Vietnamese F5-TTS checkpoint (downloaded from the Hub)."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=F5_VIETNAMESE_REPO, filename=F5_VIETNAMESE_CKPT_FILE)
+
+
+def _load_f5_vocab() -> Path:
+    """Path to the Vietnamese char-level vocab.txt for the F5-TTS tokenizer."""
+    from huggingface_hub import hf_hub_download
+
+    return Path(
+        hf_hub_download(repo_id=F5_VIETNAMESE_REPO, filename=F5_VIETNAMESE_VOCAB_FILE)
+    )
+
+
+def _import_f5_infer_deps():
+    """Import the heavy F5-TTS inference callables (lazy: pulls in torch)."""
+    from f5_tts.infer.utils_infer import load_model, load_vocoder
+
+    return load_model, load_vocoder
 
 
 def _get_f5_resources(ckpt_path: Path | None = None):
@@ -160,7 +197,6 @@ def _get_f5_resources(ckpt_path: Path | None = None):
     import soundfile as sf
     import torch
     import torchaudio
-    from huggingface_hub import hf_hub_download
 
     def sf_load(uri, *args, **kwargs):
         data, sr = sf.read(str(uri), dtype='float32')
@@ -180,21 +216,30 @@ def _get_f5_resources(ckpt_path: Path | None = None):
     torchaudio.load = sf_load
     torchaudio.save = sf_save
 
-    from f5_tts.infer.utils_infer import load_model, load_vocoder
+    load_model, load_vocoder = _import_f5_infer_deps()
     from f5_tts.model import DiT
 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     vocoder = load_vocoder(is_local=False)
     model_cls = DiT
     model_cfg = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)
+    # An explicit ckpt_path still gets the matching Vietnamese vocab, unless the
+    # caller pinned a vocab of their own via F5_VIETNAMESE_VOCAB_FILE.
     if ckpt_path and Path(ckpt_path).exists():
         real_ckpt = str(ckpt_path)
     else:
-        real_ckpt = hf_hub_download(
-            repo_id='SWivid/F5-TTS', filename='F5TTS_v1_Base/model_1250000.safetensors'
-        )
+        real_ckpt = str(_resolve_f5_ckpt())
 
-    model = load_model(model_cls, model_cfg, ckpt_path=real_ckpt, device=device)
+    vocab_file = str(_load_f5_vocab())
+
+    model = load_model(
+        model_cls,
+        model_cfg,
+        ckpt_path=real_ckpt,
+        vocab_file=vocab_file,
+        device=device,
+    )
+    logger.info(f'🎙️ [F5-TTS] Đã nạp checkpoint tiếng Việt: {real_ckpt} | vocab: {vocab_file}')
     _F5_CACHE[key] = (model, vocoder, device)
     return _F5_CACHE[key]
 
@@ -269,6 +314,13 @@ class F5TTSEngine(TTSEngine):
                 ]
                 if self.ckpt_path and self.ckpt_path.exists():
                     cmd.extend(['--ckpt_file', str(self.ckpt_path)])
+                else:
+                    # Keep the CLI on the same Vietnamese checkpoint + vocab as
+                    # the in-process path, otherwise it silently falls back to
+                    # the EN-ZH base model and produces garbled Vietnamese.
+                    cmd.extend(['--ckpt_file', str(_resolve_f5_ckpt())])
+                vocab_file = _load_f5_vocab()
+                cmd.extend(['--vocab_file', str(vocab_file)])
                 subprocess.run(cmd, check=True)
                 generated = list(Path(tmpd).glob('*.wav'))
                 if not generated:
