@@ -1,7 +1,12 @@
 """Uncertainty scanner: ``detect_uncertain_spans`` (spec 2026-10-31 §2.4)."""
+import pytest
+
 from core.text_normalizer import (
+    SENTENCE_CONTEXT_MAX_CHARS,
     UncertainSpan,
+    _sentence_at,
     detect_uncertain_spans,
+    suggest_abbreviation_reading,
     uncertain_spans_to_review,
 )
 
@@ -228,3 +233,109 @@ def test_mixed_document_reports_all_categories():
 def test_scanner_handles_vietnamese_diacritics():
     assert detect_uncertain_spans('Tỷ lệ ½ không nằm trong danh sách.') == []
     assert 'Zz7' in _tokens('Tôi thấy mã Zz7 ở đây.')
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: ngữ cảnh câu phải là ĐÚNG MỘT câu, không xuống dòng, không cả đoạn
+# ---------------------------------------------------------------------------
+def test_sentence_never_crosses_newline():
+    text = 'Dòng một nói về MC ở đây.\nDòng hai có CEO.'
+    spans = {s['token']: s for s in detect_uncertain_spans(text)}
+    assert '\n' not in spans['MC']['sentence']
+    assert 'CEO' not in spans['MC']['sentence']
+    assert spans['MC']['sentence'].endswith('ở đây.')
+
+
+def test_sentence_is_single_sentence_not_paragraph():
+    text = 'Câu mở. Anh ấy là MC giỏi. Câu sau nữa.'
+    span = next(s for s in detect_uncertain_spans(text) if s['token'] == 'MC')
+    assert span['sentence'] == 'Anh ấy là MC giỏi.'
+    assert span['sentence'].count('.') == 1
+
+
+def test_sentence_paragraph_without_punctuation_is_clipped():
+    text = ('anh ấy là một MC và dẫn chương trình rất lâu năm ở nhiều đài '
+            'truyền hình lớn nhỏ khác nhau vô cùng dài dòng').replace(' ', ' ' * 3)
+    span = next(s for s in detect_uncertain_spans(text) if s['token'] == 'MC')
+    assert '\n' not in span['sentence']
+    assert len(span['sentence']) <= SENTENCE_CONTEXT_MAX_CHARS
+    assert 'MC' in span['sentence']
+
+
+def test_long_sentence_is_clipped_around_token():
+    text = 'chữ ' * 80 + 'MC ' + 'chữ ' * 80 + '.'
+    span = next(s for s in detect_uncertain_spans(text) if s['token'] == 'MC')
+    assert len(span['sentence']) <= SENTENCE_CONTEXT_MAX_CHARS
+    assert 'MC' in span['sentence']
+    assert span['sentence'].startswith('…') or span['sentence'].endswith('…')
+
+
+def test_sentence_at_helper_handles_empty_and_missing_token():
+    assert _sentence_at('', 0, 'MC') == ''
+    assert _sentence_at('Không có token ở đây.', 3, 'XYZ') == 'Không có token ở đây.'
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: đề xuất phát âm cho từ viết tắt
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize('token, expected', [
+    ('MC', 'em-xi'),
+    ('VIP', 'víp'),
+    ('PR', 'pi-a'),
+    ('CEO', 'xi-i-ô'),
+    ('KOL', 'kây-ô-en'),
+    ('AI', 'ây-ai'),
+    ('ATM', 'ây-ti-em'),
+    ('DNA', 'đê-en-a'),
+    ('DJ', 'đi-giê'),
+    ('TV', 'ti-vi'),
+    ('FB', 'phây-bút'),
+    ('USB', 'u-ét-xpi'),
+    ('GPS', 'giê-pê-ét'),
+    ('SOS', 'ét-o-ét'),
+    ('IQ', 'ai-kiu'),
+    ('EQ', 'i-kiu'),
+    ('WC', 'vê-xê'),
+    ('SIM', 'xim'),
+    ('WIFI', 'oai-phai'),
+    ('KPI', 'kây-pi-ai'),
+    ('CV', 'xi-vi'),
+    ('IT', 'ai-ti'),
+    ('HR', 'ếch-a'),
+    ('VAT', 'vát'),
+])
+def test_known_abbreviation_pronunciations(token, expected):
+    assert suggest_abbreviation_reading(token) == expected
+
+
+@pytest.mark.parametrize('token, expected', [
+    ('VTV', 'vê-tê-vê'),
+    ('HTV', 'hát-tê-vê'),
+    ('QZ', 'quy-dét'),
+    ('XYZ', 'ích-i-dài-dét'),
+])
+def test_unknown_abbreviation_spelled_by_vietnamese_letters(token, expected):
+    assert suggest_abbreviation_reading(token) == expected
+
+
+def test_abbreviation_helper_ignores_punctuation():
+    assert suggest_abbreviation_reading('MC.') == 'em-xi'
+    assert suggest_abbreviation_reading('F.B.I') == 'ép-bê-i'
+    assert suggest_abbreviation_reading('') == ''
+    assert suggest_abbreviation_reading('123') == '123'
+
+
+def test_unknown_abbr_span_gets_pronunciation_suggestion():
+    # VTV nằm trong whitelist viết tắt quen thuộc nên không bị flag; dùng HTV/QZ.
+    spans = {s['token']: s for s in detect_uncertain_spans('MC và HTV cùng FAO và QZ.')}
+    assert spans['MC']['suggested_reading'] == 'em-xi'
+    assert spans['HTV']['suggested_reading'] == 'hát-tê-vê'
+    assert spans['FAO']['suggested_reading'] == 'ép-a-o'
+    assert spans['QZ']['suggested_reading'] == 'quy-dét'
+    # Không còn copy nguyên token như trước.
+    assert all(s['suggested_reading'] != s['token'] for s in spans.values())
+
+
+def test_known_abbreviation_whitelist_still_silent():
+    """VTV/VOV nằm trong whitelist quen thuộc: không flag, không nhiễu UI."""
+    assert detect_uncertain_spans('VTV phát sóng.') == []

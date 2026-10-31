@@ -979,19 +979,67 @@ _KNOWN_ABBREVIATIONS = {
 
 _SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+')
 
+# Ngữ cảnh trên UI phải là MỘT câu gọn: không xuống dòng, không cả đoạn văn.
+SENTENCE_CONTEXT_MAX_CHARS = 120
 
-def _sentence_at(text: str, pos: int) -> str:
-    """Câu chứa offset ``pos`` (tách theo dấu câu, giữ nguyên văn)."""
-    starts = [0] + [m.end() for m in _SENTENCE_SPLIT_RE.finditer(text)]
+
+def _one_line(text: str) -> str:
+    """Ép về một dòng: mọi loại xuống dòng/khoảng trắng thừa → một dấu cách."""
+    return re.sub(r'\s+', ' ', text or '').strip()
+
+
+def _clip_around(token: str, sentence: str, limit: int = SENTENCE_CONTEXT_MAX_CHARS) -> str:
+    """Cắt gọn quanh ``token`` nếu câu quá dài (thêm '…' ở chỗ cắt)."""
+    sentence = _one_line(sentence)
+    if len(sentence) <= limit:
+        return sentence
+    pos = sentence.find(token)
+    if pos < 0:
+        return sentence[: limit - 1].rstrip() + '…'
+    half = max(0, (limit - len(token)) // 2)
+    start = max(0, pos - half)
+    end = min(len(sentence), pos + len(token) + half)
+    prefix = '…' if start > 0 else ''
+    suffix = '…' if end < len(sentence) else ''
+    body = sentence[start:end].strip()
+    # Dấu '…' cộng vào có thể vượt limit — cắt phần thân, GIỮ cả hai dấu '…'
+    # để người đọc vẫn biết ngữ cảnh bị cắt ở hai phía.
+    room = limit - len(prefix) - len(suffix)
+    if room > 0:
+        body = body[:room]
+    return f'{prefix}{body}{suffix}'
+
+
+def _sentence_at(text: str, pos: int, token: str = '') -> str:
+    """Đúng MỘT câu chứa offset ``pos``, luôn trên một dòng.
+
+    - Không bao giờ vượt qua ``\\n``: tách đoạn theo xuống dòng trước.
+    - Chỉ trả câu chứa token (không gộp nhiều câu / cả đoạn).
+    - Câu vẫn dài → cắt gọn ngữ cảnh quanh token.
+    """
+    if not text:
+        return ''
+    # 1. Giới hạn trong một dòng chứa token.
+    line_start = text.rfind('\n', 0, pos) + 1
+    line_end = text.find('\n', pos)
+    if line_end < 0:
+        line_end = len(text)
+    line = text[line_start:line_end]
+    rel = max(0, min(pos - line_start, len(line)))
+
+    # 2. Tách câu trong dòng đó, chọn câu chứa token.
+    bounds = [0] + [m.end() for m in _SENTENCE_SPLIT_RE.finditer(line)]
     start = 0
-    for s in starts:
-        if s <= pos:
-            start = s
+    for b in bounds:
+        if b <= rel:
+            start = b
         else:
             break
-    end_match = _SENTENCE_SPLIT_RE.search(text, start)
-    end = end_match.start() if end_match else len(text)
-    return text[start:end].strip()
+    end_match = _SENTENCE_SPLIT_RE.search(line, start)
+    end = end_match.start() if end_match else len(line)
+    sentence = line[start:end]
+
+    return _clip_around(token, sentence)
 
 
 def _suggest_math(token: str) -> str:
@@ -999,6 +1047,91 @@ def _suggest_math(token: str) -> str:
         return _normalize_math(normalize_vi_text(token))
     except Exception:  # pragma: no cover - phòng thủ
         return token
+
+
+# ---------------------------------------------------------------------------
+# Phát âm từ viết tắt
+# ---------------------------------------------------------------------------
+# Viết tắt tiếng Anh đã quen trong tiếng Việt — đọc theo âm, không đánh vần.
+ABBREVIATION_PRONUNCIATIONS: dict[str, str] = {
+    'MC': 'em-xi',
+    'VIP': 'víp',
+    'PR': 'pi-a',
+    'CEO': 'xi-i-ô',
+    'KOL': 'kây-ô-en',
+    'AI': 'ây-ai',
+    'ATM': 'ây-ti-em',
+    'DNA': 'đê-en-a',
+    'DJ': 'đi-giê',
+    'TV': 'ti-vi',
+    'FB': 'phây-bút',
+    'USB': 'u-ét-xpi',
+    'GPS': 'giê-pê-ét',
+    'SOS': 'ét-o-ét',
+    'IQ': 'ai-kiu',
+    'EQ': 'i-kiu',
+    'WC': 'vê-xê',
+    'SIM': 'xim',
+    'WIFI': 'oai-phai',
+    'KPI': 'kây-pi-ai',
+    'CV': 'xi-vi',
+    'IT': 'ai-ti',
+    'HR': 'ếch-a',
+    'VAT': 'vát',
+}
+
+# Bảng chữ cái tiếng Việt dùng khi đánh vần viết tắt lạ (VTV → vê-tê-vê).
+VIETNAMESE_LETTER_NAMES: dict[str, str] = {
+    'A': 'a',
+    'B': 'bê',
+    'C': 'xê',
+    'D': 'dê',
+    'E': 'e',
+    'F': 'ép',
+    'G': 'giê',
+    'H': 'hát',
+    'I': 'i',
+    'J': 'giây',
+    'K': 'ca',
+    'L': 'en',
+    'M': 'em',
+    'N': 'en',
+    'O': 'o',
+    'P': 'pê',
+    'Q': 'quy',
+    'R': 'e-rờ',
+    'S': 'ét',
+    'T': 'tê',
+    'U': 'u',
+    'V': 'vê',
+    'W': 'vê-kép',
+    'X': 'ích',
+    'Y': 'i-dài',
+    'Z': 'dét',
+}
+
+
+def suggest_abbreviation_reading(token: str) -> str:
+    """Đề xuất cách đọc cho một từ viết tắt.
+
+    - Ưu tiên ``ABBREVIATION_PRONUNCIATIONS`` (MC → ``em-xi``).
+    - Còn lại đánh vần từng chữ theo ``VIETNAMESE_LETTER_NAMES``
+      (VTV → ``vê-tê-vê``).
+    - Ký tự không phải ``A-Z`` (dấu ``.``, ``&``…) bị bỏ qua.
+
+    >>> suggest_abbreviation_reading('MC')
+    'em-xi'
+    >>> suggest_abbreviation_reading('VTV')
+    'vê-tê-vê'
+    """
+    key = re.sub(r'[^A-Za-z]', '', token or '').upper()
+    if not key:
+        return token or ''
+    if key in ABBREVIATION_PRONUNCIATIONS:
+        return ABBREVIATION_PRONUNCIATIONS[key]
+    letters = [VIETNAMESE_LETTER_NAMES.get(ch, ch.lower()) for ch in key]
+    return '-'.join(letters)
+
 
 
 def _looks_like_acronym(token: str) -> bool:
@@ -1068,7 +1201,7 @@ def detect_uncertain_spans(text: str) -> list[dict]:
         spans.append(
             UncertainSpan(
                 token=token,
-                sentence=_sentence_at(text, start),
+                sentence=_sentence_at(text, start, token),
                 reason=reason,
                 start=start,
                 end=end,
@@ -1130,7 +1263,7 @@ def detect_uncertain_spans(text: str) -> list[dict]:
         tail_end = match.end()
         if tail_end < len(text) and (text[tail_end].isalpha() or text[tail_end].isdigit()):
             continue
-        sentence_start = _sentence_at(text, match.start())
+        sentence_start = _sentence_at(text, match.start(), token)
         if sentence_start and sentence_start[0] == token[0] and text.startswith(token, match.start()):
             # Chữ hoa đầu câu một chữ ("Trời") — không phải viết tắt.
             if token[1:2].islower() or len(token) == 1:
@@ -1141,7 +1274,8 @@ def detect_uncertain_spans(text: str) -> list[dict]:
             continue  # đã thuộc mixed_alphanumeric
         if token[1:].islower():
             continue  # "Chương", "Xin" — chữ hoa đầu câu, không phải viết tắt
-        add(token, match.start(), match.end(), 'unknown_abbr', token)
+        add(token, match.start(), match.end(), 'unknown_abbr',
+            suggest_abbreviation_reading(token))
 
     # Bỏ span nằm lồng trong span khác cùng offset (thường là ký hiệu toán nằm
     # trong cả biểu thức đã bắt trọn) — giữ span dài nhất.

@@ -192,3 +192,103 @@ def test_handle_generate_m4b_with_abs_sync(mock_is_cfg, mock_sync, tmp_path: Pat
     assert mock_sync.called
     assert 'Audiobookshelf' in status
     assert 'Đã chuyển' in status
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: cột "Ngữ cảnh" chỉ chứa đúng MỘT câu, không xuống dòng
+# ---------------------------------------------------------------------------
+def test_uncertainty_rows_context_is_single_line():
+    state = {'chapters': [{'enabled': True, 'markdown':
+        'Câu mở đầu.\nAnh ấy là MC của chương trình và CEO công ty.\n\nĐoạn khác có VIP.'}]}
+    rows = app.extract_uncertainty_rows(state)
+    assert rows
+    for token, _cat, context, _reading in rows:
+        assert '\n' not in context, f'ngữ cảnh của {token} bị xuống dòng: {context!r}'
+        assert '\r' not in context
+        assert len(context) <= 120
+        assert token in context
+
+
+def test_uncertainty_rows_context_does_not_dump_paragraph():
+    state = {'chapters': [{'enabled': True, 'markdown':
+        'Câu một. Câu hai nói MC. Câu ba. Câu bốn. Câu năm.'}]}
+    rows = app.extract_uncertainty_rows(state)
+    mc = next(r for r in rows if r[0] == 'MC')
+    assert mc[2].count('.') == 1, mc[2]
+    assert 'Câu một' not in mc[2], 'không được gộp câu trước'
+
+
+def test_one_line_snippet_clips_long_text():
+    long = 'x' * 200 + ' MC ' + 'y' * 200
+    out = app._one_line_snippet(long, 'MC', limit=60)
+    assert len(out) <= 60
+    assert 'MC' in out
+    assert '\n' not in out
+    assert out.startswith('…') and out.endswith('…')
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: cột "Đề xuất phát âm" có cách đọc thật cho viết tắt
+# ---------------------------------------------------------------------------
+def test_uncertainty_rows_abbr_has_real_pronunciation():
+    state = {'chapters': [{'enabled': True, 'markdown': 'Anh ấy là MC và CEO.'}]}
+    rows = {r[0]: r for r in app.extract_uncertainty_rows(state)}
+    assert rows['MC'][3] == 'em-xi'
+    assert rows['CEO'][3] == 'xi-i-ô'
+    assert rows['MC'][3] != 'MC'
+
+
+# ---------------------------------------------------------------------------
+# Issue 3: dropdown label → tên giọng chuẩn trước khi vào TTS engine
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize('label, expected', [
+    ('Giọng kể chuyện · Thiện Minh — Nam · Bắc · Phong cách kể chuyện', 'Thiện Minh'),
+    ('Giọng tuyển chọn ⭐ · Adam bựa — Nam · Bắc · Phong cách tự nhiên', 'Adam bựa'),
+    ('Giọng tin tức & tự nhiên · Phạm Tuyên — Nam · Bắc', 'Phạm Tuyên'),
+    ('Thiện Minh', 'Thiện Minh'),
+    ('Adam bựa', 'Adam bựa'),
+    ('', ''),
+    (None, ''),
+])
+def test_extract_voice_name(label, expected):
+    assert app.extract_voice_name(label) == expected
+
+
+def test_extract_voice_name_handles_dash_separator():
+    assert app.extract_voice_name('Giọng kể chuyện · Thái Sơn - Nam - Bắc') == 'Thái Sơn'
+
+
+def test_create_tts_engine_extracts_voice_from_dropdown_label(monkeypatch):
+    """Regression: trước đây cả nhãn dropdown bị truyền vào VieNeuEngine(voice=...)."""
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, mode, voice=None, **kwargs):
+            captured['mode'] = mode
+            captured['voice'] = voice
+
+    monkeypatch.setattr(app, 'VieNeuEngine', FakeEngine)
+    label = 'Giọng kể chuyện · Thiện Minh — Nam · Bắc · Phong cách kể chuyện'
+    app._create_tts_engine(
+        'VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)', label, 0
+    )
+    assert captured['voice'] == 'Thiện Minh'
+    assert '·' not in captured['voice'] and '—' not in captured['voice']
+
+
+def test_create_tts_engine_keeps_clone_and_classic_routing(monkeypatch):
+    captured = {}
+
+    class FakeEngine:
+        def __init__(self, mode, voice=None, **kwargs):
+            captured['mode'] = mode
+            captured['voice'] = voice
+
+    monkeypatch.setattr(app, 'VieNeuEngine', FakeEngine)
+    monkeypatch.setattr(app, '_clone_reference_for_label', lambda _l: ('ref.wav', 'text'))
+
+    app._create_tts_engine('VieNeu-TTS v3 Turbo', 'Clone · Vui Vẻ', 0)
+    assert captured['mode'] == 'clone'
+
+    app._create_tts_engine('VieNeu-TTS v3 Turbo', 'Nguyễn Ngọc Ngạn (kinh điển)', 0)
+    assert captured['mode'] == 'classic'

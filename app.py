@@ -54,6 +54,28 @@ def _chapter_label(ch: Chapter) -> str:
     return f'[{ch.index:02d}] {ch.title}'
 
 
+def _one_line_snippet(sentence: str, token: str, limit: int = 120) -> str:
+    """Một dòng duy nhất, không xuống dòng, tối đa ``limit`` ký tự quanh ``token``."""
+    text = re.sub(r'\s+', ' ', sentence or '').strip()
+    if len(text) <= limit:
+        return text
+    pos = text.find(token)
+    if pos < 0:
+        return text[: limit - 1].rstrip() + '…'
+    half = max(0, (limit - len(token)) // 2)
+    start = max(0, pos - half)
+    end = min(len(text), pos + len(token) + half)
+    prefix = '…' if start > 0 else ''
+    suffix = '…' if end < len(text) else ''
+    body = text[start:end].strip()
+    # Dấu '…' cộng vào có thể vượt limit — cắt phần thân, GIỮ cả hai dấu '…'
+    # để người đọc vẫn biết ngữ cảnh bị cắt ở hai phía.
+    room = limit - len(prefix) - len(suffix)
+    if room > 0:
+        body = body[:room]
+    return f'{prefix}{body}{suffix}'
+
+
 def extract_uncertainty_rows(state: dict) -> list[list[str]]:
     """Scan chapters in state for ambiguous or tricky tokens (math, chem, fractions, strange abbrs)."""
     if not state or 'chapters' not in state:
@@ -80,7 +102,9 @@ def extract_uncertainty_rows(state: dict) -> list[list[str]]:
                 continue
             seen_tokens.add(token)
             cat = category_map.get(sp['reason'], sp['reason'])
-            rows.append([token, cat, sp['sentence'], sp['suggested_reading']])
+            # Bảng UI chỉ hiển thị MỘT câu gọn: ép về một dòng và cắt quanh token.
+            snippet = _one_line_snippet(sp.get('sentence', ''), token)
+            rows.append([token, cat, snippet, sp['suggested_reading']])
             if len(rows) >= 150:
                 break
         if len(rows) >= 150:
@@ -382,6 +406,41 @@ def handle_chapter_selection(selected_labels: list[str], state: dict) -> str:
     return '\n\n'.join(enabled_mds) + ('\n' if enabled_mds else '')
 
 
+def extract_voice_name(label: str) -> str:
+    """Tên giọng chuẩn từ một nhãn dropdown (hoặc tên trần).
+
+    Nhãn dropdown có dạng ``"<section> · <Tên> — <giới tính · vùng · phong cách>"``.
+    Lấy phần sau dấu ``·`` (dấu đầu tiên), cắt ở ``—`` hoặc ``-``, rồi strip.
+
+    >>> extract_voice_name('Giọng kể chuyện · Thiện Minh — Nam · Bắc · Phong cách kể chuyện')
+    'Thiện Minh'
+    >>> extract_voice_name('Giọng tuyển chọn ⭐ · Adam bựa — Nam · Bắc')
+    'Adam bựa'
+    >>> extract_voice_name('Thiện Minh')
+    'Thiện Minh'
+    """
+    raw = (label or '').strip()
+    if not raw:
+        return ''
+    if '·' in raw:
+        raw = raw.split('·', 1)[1]
+    # Cắt phần metadata sau tên: '—' hoặc ' - '.
+    for sep in ('—', '–', ' - '):
+        if sep in raw:
+            raw = raw.split(sep, 1)[0]
+            break
+    return raw.strip()
+
+
+def _is_preset_label(label: str) -> bool:
+    """Nhãn dropdown thuộc một giọng preset (không phải clone/classic đặc biệt)."""
+    if not label:
+        return False
+    if label.startswith('Clone ·') or label.startswith('Nguyễn Ngọc Ngạn'):
+        return False
+    return True
+
+
 def _create_tts_engine(
     engine_choice: str,
     voice_choice: str,
@@ -408,11 +467,10 @@ def _create_tts_engine(
         return VieNeuEngine(mode='clone', ref_audio=ref_audio, ref_text=ref_text)
     if label.startswith('Nguyễn Ngọc Ngạn'):
         return VieNeuEngine(mode='classic')
-    if label.startswith('Giọng sẵn có ·'):
-        return VieNeuEngine(mode='preset', voice=label.split('·', 1)[1].strip())
-    if label and not label.startswith('Clone ·'):
-        # The dropdown was replaced (or a test passed a raw preset name).
-        return VieNeuEngine(mode='preset', voice=label)
+    if _is_preset_label(label):
+        # Nhãn dropdown mới dạng "Giọng tuyển chọn ⭐ · Thiện Minh — Nam · Bắc · …"
+        # → phải trích tên chuẩn, không được truyền nguyên nhãn làm tên giọng.
+        return VieNeuEngine(mode='preset', voice=extract_voice_name(label) or DEFAULT_PRESET_VOICE)
     return VieNeuEngine(mode='preset', voice=DEFAULT_PRESET_VOICE)
 
 
