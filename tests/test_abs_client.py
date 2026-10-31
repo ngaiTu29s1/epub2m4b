@@ -178,11 +178,25 @@ def test_upload_file_success(mock_post, tmp_path: Path):
     test_file.write_bytes(b'AUDIO')
 
     client = ABSClient(base_url='http://abs.local', token='token123', library_id='lib_1')
-    res = client.upload_file(test_file)
+    with patch.object(client, 'get_library_folder_id', return_value='fol_1'):
+        res = client.upload_file(test_file, author='Tác Giả', title='Tên Sách')
 
     assert res['success'] is True
     assert res['library_id'] == 'lib_1'
+    assert res['folder_id'] == 'fol_1'
     assert mock_post.called
+
+    url = mock_post.call_args[0][0]
+    assert url == 'http://abs.local/api/upload'
+    kwargs = mock_post.call_args[1]
+    assert kwargs['data'] == {
+        'title': 'Tên Sách',
+        'author': 'Tác Giả',
+        'library': 'lib_1',
+        'folder': 'fol_1',
+    }
+    assert 'files' in kwargs['files']
+    assert kwargs['headers']['Authorization'] == 'Bearer token123'
 
 
 @patch('requests.post')
@@ -266,13 +280,17 @@ def test_upload_file_autodetects_library_when_missing(tmp_path: Path):
     ok.json.return_value = {}
 
     with patch.object(client, 'find_audiobook_library_id', return_value='lib_auto') as finder, \
+         patch.object(client, 'get_library_folder_id', return_value='fol_auto'), \
          patch('requests.post', return_value=ok) as post:
         res = client.upload_file(source)
 
     assert finder.called
     assert res['success'] is True
     assert res['library_id'] == 'lib_auto'
-    assert '/api/libraries/lib_auto/upload' in post.call_args[0][0]
+    assert post.call_args[0][0] == 'http://abs.local/api/upload'
+    assert post.call_args[1]['data']['folder'] == 'fol_auto'
+    assert post.call_args[1]['data']['title'] == 'b'
+    assert post.call_args[1]['data']['author'] == 'Unknown' 
 
 
 def test_upload_file_missing_file_returns_error(tmp_path: Path):
@@ -325,3 +343,108 @@ def test_sync_missing_file_returns_error(tmp_path: Path):
     res = client.sync_audiobook(tmp_path / 'ghost.m4b', author='A', title='T')
     assert res['success'] is False
     assert 'không tồn tại' in res['error'].lower()
+
+
+# ---------------------------------------------------------------------------
+# ABS upload: cần folder ID của library (endpoint /api/upload)
+# ---------------------------------------------------------------------------
+def test_get_library_folder_id_from_libraries(monkeypatch):
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='lib_1')
+    monkeypatch.setattr(client, 'get_libraries', lambda: [
+        {'id': 'lib_2', 'folders': [{'id': 'other'}]},
+        {'id': 'lib_1', 'folders': [{'id': 'fol_1', 'fullPath': '/audiobooks'}]},
+    ])
+    assert client.get_library_folder_id() == 'fol_1'
+    assert client.get_library_folder_id('lib_2') == 'other'
+
+
+def test_get_library_folder_id_missing_cases(monkeypatch):
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='lib_1')
+    monkeypatch.setattr(client, 'get_libraries', lambda: [{'id': 'lib_1'}])
+    assert client.get_library_folder_id() is None, 'library không có folders → None'
+
+    monkeypatch.setattr(client, 'get_libraries', lambda: [{'id': 'lib_1', 'folders': []}])
+    assert client.get_library_folder_id() is None
+
+    monkeypatch.setattr(client, 'get_libraries', lambda: [{'id': 'lib_1', 'folders': [{'id': ''}]}])
+    assert client.get_library_folder_id() is None
+
+    monkeypatch.setattr(client, 'get_libraries', lambda: [{'id': 'lib_other', 'folders': [{'id': 'x'}]}])
+    assert client.get_library_folder_id('lib_1') is None, 'id không khớp → None'
+
+
+def test_get_library_folder_id_without_library_id(monkeypatch):
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='')
+    monkeypatch.setattr(client, 'get_libraries', lambda: [{'id': 'a', 'folders': [{'id': 'f'}]}])
+    assert client.get_library_folder_id() is None
+
+
+def test_upload_file_fails_clearly_without_folder(tmp_path: Path):
+    source = tmp_path / 'no_folder.m4b'
+    source.write_bytes(b'AUDIO')
+
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='lib_1')
+    with patch.object(client, 'get_library_folder_id', return_value=None), \
+         patch('requests.post') as post:
+        res = client.upload_file(source)
+
+    assert res['success'] is False
+    assert 'folder' in res['error'].lower()
+    assert not post.called, 'không được gọi upload khi thiếu folder id'
+
+
+def test_upload_file_defaults_title_and_author(tmp_path: Path):
+    source = tmp_path / 'ten_file.m4b'
+    source.write_bytes(b'AUDIO')
+    ok = MagicMock(status_code=200, text='')
+    ok.headers = {'content-type': 'text/plain'}
+
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='lib_1')
+    with patch.object(client, 'get_library_folder_id', return_value='fol'), \
+         patch('requests.post', return_value=ok) as post:
+        client.upload_file(source)
+
+    data = post.call_args[1]['data']
+    assert data['title'] == 'ten_file'
+    assert data['author'] == 'Unknown'
+    assert data['library'] == 'lib_1'
+    assert data['folder'] == 'fol'
+
+
+def test_sync_audiobook_passes_author_and_title_to_upload(tmp_path: Path):
+    source = tmp_path / 'raw.m4b'
+    source.write_bytes(b'AUDIO')
+
+    client = ABSClient(
+        base_url='http://abs.local', token='t', library_id='lib_1',
+        storage_path=None, auto_scan=False,
+    )
+    with patch.object(client, 'upload_file', return_value={'success': True}) as up:
+        res = client.sync_audiobook(source, author='Nguyễn Nhật Ánh', title='Tôi Thấy Hoa Vàng')
+
+    assert res['success'] is True
+    assert up.call_args[0][0] == source
+    assert up.call_args[1]['author'] == 'Nguyễn Nhật Ánh'
+    assert up.call_args[1]['title'] == 'Tôi Thấy Hoa Vàng'
+
+
+def test_upload_uses_generic_upload_endpoint(tmp_path: Path):
+    """Thực tế trên ABS server: POST /api/upload trả 200;
+    /api/libraries/{id}/upload trả 404."""
+    source = tmp_path / 'a.m4b'
+    source.write_bytes(b'AUDIO')
+    ok = MagicMock(status_code=200, text='')
+    ok.headers = {'content-type': 'text/plain'}
+
+    client = ABSClient(base_url='http://abs.local', token='t', library_id='lib_abc')
+    with patch.object(client, 'get_library_folder_id', return_value='fol'), \
+         patch('requests.post', return_value=ok) as post:
+        client.upload_file(source)
+
+    url = post.call_args[0][0]
+    assert url == 'http://abs.local/api/upload'
+    assert '/api/libraries/' not in url, 'endpoint này trả 404 trên server thật'
+    # library/folder vẫn đi trong multipart data, không phải trong URL.
+    data = post.call_args[1]['data']
+    assert data['library'] == 'lib_abc'
+    assert data['folder'] == 'fol'

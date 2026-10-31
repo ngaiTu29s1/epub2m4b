@@ -495,9 +495,10 @@ class VieNeuEngine(TTSEngine):
         """Batch nhiều câu qua một lời gọi ``tts._infer_chunks`` (CUDA graph).
 
         Trả ``[(waveform_24k_float32, duration_ms), ...]`` đúng thứ tự ``texts``.
-        Toàn bộ phoneme của mọi câu được gộp phẳng rồi chia nhóm ``batch_size``,
+        Chunk raw text của mọi câu được gộp phẳng rồi chia nhóm ``batch_size``,
         nên các câu ngắn vẫn lấp đầy một forward (thay vì 1 chunk/lần như
-        ``synthesize_segment``).
+        ``synthesize_segment``). KHÔNG phonemize ở tầng này — ``_infer_chunks``
+        đã tự làm.
         """
         if not texts:
             return []
@@ -506,19 +507,23 @@ class VieNeuEngine(TTSEngine):
         speaker_emb, ref_codes = self._resolve_reference(tts)
         orig_sr = int(getattr(tts, 'sample_rate', 48000))
 
-        all_phonemes: list[str] = []
+        all_chunks: list[str] = []
         per_text: list[tuple[int, int, list[float]]] = []
         for text in texts:
             chunks, gaps = _upstream_chunker()(text, max_chars=256)
-            start = len(all_phonemes)
-            all_phonemes.extend(_upstream_phonemize()(c) for c in chunks)
-            per_text.append((start, len(all_phonemes), list(gaps)))
+            start = len(all_chunks)
+            # Truyền RAW TEXT chunk. ``tts._infer_chunks`` tự gọi
+            # ``phonemize_text_with_emotions`` bên trong — phonemize ở đây sẽ
+            # khiến IPA/số bị đánh vần lần hai ('ét in tê a hai…') và audio
+            # dài gấp ~2.5 lần.
+            all_chunks.extend(chunks)
+            per_text.append((start, len(all_chunks), list(gaps)))
 
-        if not all_phonemes:
+        if not all_chunks:
             return [(_write_silence_array(), 200) for _ in texts]
 
         wavs = tts._infer_chunks(
-            all_phonemes,
+            all_chunks,
             speaker_emb,
             ref_codes,
             True,

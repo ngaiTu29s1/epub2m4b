@@ -159,7 +159,6 @@ def test_batch_preserves_order_and_concatenates_chunks(fake_model, monkeypatch):
             (['a', 'b'], [0.1, 0.1]) if text == 'Dài.' else (['c'], [0.1])
         )),
     )
-    monkeypatch.setattr(vieneu_engine, '_upstream_phonemize', lambda: (lambda c: c))
     engine = VieNeuEngine(mode='preset', voice='Bình', device='cuda', batch_size=4)
     results = engine.synthesize_segments_batch(['Dài.', 'Ngắn.'])
     assert len(results) == 2
@@ -295,3 +294,53 @@ def test_render_chapter_batch_pause_is_written(tmp_path: Path):
     res = render_chapter(chap, engine, tmp_path)
     gaps = [nxt.start_ms - prev.end_ms for prev, nxt in zip(res.cues, res.cues[1:])]
     assert any(g > 0 for g in gaps), f'kỳ vọng có khoảng lặng, nhận {gaps}'
+
+
+# ---------------------------------------------------------------------------
+# Regression: KHÔNG phonemize trước khi đưa vào _infer_chunks
+# ---------------------------------------------------------------------------
+def test_batch_passes_raw_text_chunks_not_phonemes(fake_model, monkeypatch):
+    """``_infer_chunks`` tự phonemize; gọi thêm ở đây gây double-phonemize."""
+    monkeypatch.setattr(
+        vieneu_engine, '_upstream_chunker',
+        lambda: (lambda text, max_chars=256: ([f'raw:{text}'], [0.1])),
+    )
+
+    def _boom(_chunk):
+        raise AssertionError(
+            'synthesize_segments_batch không được gọi phonemize — '
+            '_infer_chunks đã tự phonemize (double-phonemize → audio x2.5)'
+        )
+
+    monkeypatch.setattr(vieneu_engine, '_upstream_phonemize', lambda: _boom)
+
+    engine = VieNeuEngine(mode='preset', voice='Bình', device='cuda', batch_size=4)
+    engine.synthesize_segments_batch(['Câu một.', 'Câu hai.'])
+
+    sent = fake_model.calls[0]['phonemes']
+    assert sent == ['raw:Câu một.', 'raw:Câu hai.'], sent
+
+
+def test_batch_does_not_call_phonemize_at_all(fake_model, monkeypatch):
+    calls = {'n': 0}
+
+    def counting_phonemize(chunk):
+        calls['n'] += 1
+        return chunk
+
+    monkeypatch.setattr(vieneu_engine, '_upstream_phonemize', lambda: counting_phonemize)
+    engine = VieNeuEngine(mode='preset', voice='Bình', device='cuda', batch_size=4)
+    engine.synthesize_segments_batch(['Một câu có số 2024 và IPA /a/.'])
+    assert calls['n'] == 0, f'phonemize bị gọi {calls["n"]} lần'
+
+
+def test_batch_ipa_like_input_stays_verbatim(fake_model, monkeypatch):
+    """Chuỗi giống IPA/số không được biến đổi trước khi tới model."""
+    ipa = 'kˈaː˧˥ ɗi tɛ ɑ'
+    monkeypatch.setattr(
+        vieneu_engine, '_upstream_chunker',
+        lambda: (lambda text, max_chars=256: ([text], [0.1])),
+    )
+    engine = VieNeuEngine(mode='preset', voice='Bình', device='cuda', batch_size=2)
+    engine.synthesize_segments_batch([ipa])
+    assert fake_model.calls[0]['phonemes'] == [ipa]

@@ -226,10 +226,34 @@ class ABSClient:
         logger.info(f'✅ [ABS STORAGE] Sao chép hoàn tất: {dest_file.name}')
         return dest_file
 
-    def upload_file(self, file_path: Path, library_id: str | None = None) -> dict[str, Any]:
+    def get_library_folder_id(self, library_id: str | None = None) -> str | None:
+        """ID của folder đầu tiên thuộc thư viện ``library_id``.
+
+        ABS upload cần ``folder`` (folder ID của library) chứ không phải đường
+        dẫn. Thư viện không có ``folders`` → trả ``None``.
         """
-        Upload audiobook file via REST API multipart upload.
-        Endpoint: POST /api/libraries/{id}/upload
+        target = library_id or self.library_id
+        if not target:
+            return None
+        for lib in self.get_libraries():
+            if str(lib.get('id')) != str(target):
+                continue
+            folders = lib.get('folders') or []
+            if folders and isinstance(folders[0], dict):
+                folder_id = folders[0].get('id')
+                return str(folder_id) if folder_id else None
+            return None
+        return None
+
+    def upload_file(self, file_path: Path, library_id: str | None = None,
+                    author: str | None = None, title: str | None = None) -> dict[str, Any]:
+        """
+        Upload audiobook qua REST API thật của Audiobookshelf.
+
+        Endpoint: ``POST /api/upload`` với multipart gồm ``title``, ``author``,
+        ``library``, ``folder`` và ``files``.
+        (``/api/libraries/{id}/upload`` KHÔNG tồn tại — trả 404, đã kiểm chứng
+        trên server ABS thật.)
         """
         if not self.is_configured():
             return {'success': False, 'error': 'ABS chưa được cấu hình URL hoặc Token'}
@@ -242,18 +266,44 @@ class ABSClient:
         if not target_lib:
             return {'success': False, 'error': 'Không tìm thấy ID thư viện Audiobookshelf để upload'}
 
-        url = f'{self.base_url}/api/libraries/{target_lib}/upload'
-        logger.info(f'📤 [ABS UPLOAD] Đang tải lên {file_path.name} tới thư viện {target_lib}...')
+        folder_id = self.get_library_folder_id(target_lib)
+        if not folder_id:
+            err = (
+                f'Không lấy được folder ID của thư viện {target_lib}. '
+                'Kiểm tra thư viện đã có folder (đường dẫn lưu sách) trên server ABS.'
+            )
+            logger.error(f'❌ [ABS UPLOAD] {err}')
+            return {'success': False, 'error': err, 'library_id': target_lib}
+
+        url = f'{self.base_url}/api/upload'
+        logger.info(
+            f'📤 [ABS UPLOAD] Đang tải lên {file_path.name} tới thư viện '
+            f'{target_lib} (folder {folder_id})...'
+        )
+
+        data = {
+            'title': title or file_path.stem,
+            'author': author or 'Unknown',
+            'library': target_lib,
+            'folder': folder_id,
+        }
 
         try:
             with open(file_path, 'rb') as f:
                 files = {'files': (file_path.name, f, 'audio/x-m4b')}
-                resp = requests.post(url, headers={'Authorization': f'Bearer {self.token}'}, files=files, timeout=300.0)
+                resp = requests.post(
+                    url,
+                    headers={'Authorization': f'Bearer {self.token}'},
+                    data=data,
+                    files=files,
+                    timeout=300.0,
+                )
                 if resp.status_code in (200, 201, 204):
                     logger.info('✅ [ABS UPLOAD] Tải lên thành công!')
                     return {
                         'success': True,
                         'library_id': target_lib,
+                        'folder_id': folder_id,
                         'status_code': resp.status_code,
                         'data': resp.json() if resp.text and resp.headers.get('content-type', '').startswith('application/json') else {},
                     }
@@ -330,7 +380,9 @@ class ABSClient:
 
         # 2. REST API upload attempt
         if self.is_configured():
-            upload_res = self.upload_file(file_path, target_lib)
+            upload_res = self.upload_file(
+                file_path, target_lib, author=author, title=title
+            )
             if not upload_res.get('success'):
                 return upload_res
             scan_res = self.trigger_scan(target_lib) if should_scan else {'success': True}
