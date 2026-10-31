@@ -33,6 +33,27 @@ from core.tts_engine import SAMPLE_RATE, TTSEngine, _get_ffmpeg_bin, _wav_durati
 
 logger = logging.getLogger('epub2m4b.vieneu')
 
+
+def _upstream_phonemize():
+    """``phonemize_text_with_emotions`` từ vieneu_utils (import lười)."""
+    from vieneu_utils.phonemize_text import phonemize_text_with_emotions
+
+    return phonemize_text_with_emotions
+
+
+def _upstream_chunker():
+    """``normalize_to_chunks_v3_with_gaps`` từ vieneu_utils (import lười)."""
+    from vieneu_utils.phonemize_text import normalize_to_chunks_v3_with_gaps
+
+    return normalize_to_chunks_v3_with_gaps
+
+
+def _upstream_join():
+    """``join_audio_chunks`` + ``gaps_to_silence`` — cùng logic nối của ``infer``."""
+    from vieneu_utils.core_utils import gaps_to_silence, join_audio_chunks
+
+    return join_audio_chunks, gaps_to_silence
+
 # nguyen-brat/nguyen-ngoc-ngan-vieneu-tts-fine-tune: a v3-Turbo fine-tune whose
 # weights live at the repo root and whose bundled ``tokenizer.json`` is broken,
 # so it must be loaded with the *base* repo's tokenizer.
@@ -95,6 +116,17 @@ DEFAULT_PRESET_VOICE = 'Hải Đăng'
 # Số chunk gộp mỗi forward của VieNeu-TTS v3 Turbo trên CUDA (CUDA Graph
 # batching). 4 chunk vừa 8GB VRAM nhưng vẫn đạt ~2–3× tốc độ so với batch 1.
 DEFAULT_BATCH_SIZE_CUDA = 4
+
+# Tham số sampling mặc định của ``Vieneu.infer``. ``_infer_chunks`` đọc
+# ``sampling["max_new_frames"]`` trực tiếp (qua ``_cap_frames``) nên KHÔNG được
+# truyền dict rỗng — phải dùng đủ bộ giá trị này.
+DEFAULT_SAMPLING: dict = {
+    'temperature': 0.8,
+    'top_k': 25,
+    'top_p': 0.95,
+    'max_new_frames': 300,
+    'repetition_penalty': 1.2,
+}
 
 DEFAULT_CLASSIC_NGAN_REF_WAV = (
     Path(__file__).resolve().parent.parent
@@ -327,6 +359,84 @@ class VieNeuEngine(TTSEngine):
             return 'classic:Nguyễn Ngọc Ngạn'
         return f'clone:{self.ref_audio}'
 
+    # -- reference resolution (shared by single & batch synthesis) ---------
+    def _resolve_reference(self, tts) -> tuple[object, object | None]:
+        """Trả ``(speaker_emb, ref_codes)`` cho giọng hiện tại, một lần cho cả batch."""
+        if self.mode == 'preset':
+            return tts._resolve_ref(
+                voice=self.voice, ref_audio=None, denoise=True, use_ref_codes=True,
+            )
+        if self.mode == 'classic':
+            try:
+                if tts is None:  # pragma: no cover - defensive
+                    raise RuntimeError('no model')
+                return tts._resolve_ref(
+                    voice=tts.get_preset_voice(), ref_audio=None,
+                    denoise=True, use_ref_codes=True,
+                )
+            except Exception:  # pragma: no cover - fallback to clone reference
+                pass
+            ref_audio, _ = self._reference_for_classic()
+        else:
+            if not self.ref_audio or not Path(self.ref_audio).exists():
+                raise FileNotFoundError(
+                    f'Chế độ clone cần một file WAV mẫu hợp lệ, nhận được: {self.ref_audio}'
+                )
+            ref_audio = Path(self.ref_audio)
+        return tts._resolve_ref(
+            voice=None, ref_audio=str(ref_audio), denoise=True, use_ref_codes=True,
+        )
+
+    def synthesize_segments_batch(self, texts: list[str]) -> list[tuple[np.ndarray, int]]:
+        """Batch nhiều câu qua một lời gọi ``tts._infer_chunks`` (CUDA graph).
+
+        Trả ``[(waveform_24k_float32, duration_ms), ...]`` đúng thứ tự ``texts``.
+        Toàn bộ phoneme của mọi câu được gộp phẳng rồi chia nhóm ``batch_size``,
+        nên các câu ngắn vẫn lấp đầy một forward (thay vì 1 chunk/lần như
+        ``synthesize_segment``).
+        """
+        if not texts:
+            return []
+
+        tts = load_vieneu_model(self.device)
+        speaker_emb, ref_codes = self._resolve_reference(tts)
+        orig_sr = int(getattr(tts, 'sample_rate', 48000))
+
+        all_phonemes: list[str] = []
+        per_text: list[tuple[int, int, list[float]]] = []
+        for text in texts:
+            chunks, gaps = _upstream_chunker()(text, max_chars=256)
+            start = len(all_phonemes)
+            all_phonemes.extend(_upstream_phonemize()(c) for c in chunks)
+            per_text.append((start, len(all_phonemes), list(gaps)))
+
+        if not all_phonemes:
+            return [(_write_silence_array(), 200) for _ in texts]
+
+        wavs = tts._infer_chunks(
+            all_phonemes,
+            speaker_emb,
+            ref_codes,
+            True,
+            batch_size=self.batch_size,
+            sampling=dict(DEFAULT_SAMPLING),
+        )
+
+        join_audio_chunks, gaps_to_silence = _upstream_join()
+        results: list[tuple[np.ndarray, int]] = []
+        for start, end, gaps in per_text:
+            if start == end:
+                # Câu rỗng/toàn khoảng trắng không sinh chunk nào → im lặng 200 ms.
+                results.append((_write_silence_array(), 200))
+                continue
+            wav = join_audio_chunks(
+                wavs[start:end], orig_sr, silence_ps=gaps_to_silence(gaps)
+            )
+            wav = _resample_waveform_in_memory(wav, orig_sr, SAMPLE_RATE)
+            duration_ms = int(round(len(wav) / float(SAMPLE_RATE) * 1000))
+            results.append((wav, duration_ms))
+        return results
+
     # -- synthesis --------------------------------------------------------
     def synthesize_segment(self, text: str, out_wav: Path) -> int:
         out_wav = Path(out_wav)
@@ -399,19 +509,53 @@ def _write_silence(out_wav: Path, milliseconds: int) -> int:
     return milliseconds
 
 
-def _write_wav_resampled(samples: np.ndarray, sample_rate: int, out_wav: Path) -> int:
-    """Write ``samples`` as mono 16-bit PCM at ``SAMPLE_RATE`` (ffmpeg resample)."""
-    import soundfile as sf
+def _resample_waveform_in_memory(
+    samples: np.ndarray,
+    orig_sr: int,
+    target_sr: int,
+) -> np.ndarray:
+    """Resample mono waveform trong RAM (soxr → torchaudio → scipy).
 
-    samples = np.asarray(samples)
+    Không ghi đĩa, không subprocess ở đường thường. Trả 1-D ``float32``.
+    """
     if samples.ndim > 1:
         samples = samples.reshape(-1)
-    if samples.size == 0:
-        return _write_silence(out_wav, milliseconds=200)
+    samples = samples.astype(np.float32, copy=False)
+    if orig_sr == target_sr or samples.size == 0:
+        return samples
 
-    if sample_rate == SAMPLE_RATE:
-        sf.write(str(out_wav), samples.astype(np.float32), SAMPLE_RATE, subtype='PCM_16')
-        return _wav_duration_ms(out_wav)
+    try:
+        import soxr
+
+        return np.asarray(soxr.resample(samples, orig_sr, target_sr), dtype=np.float32)
+    except Exception as exc:  # pragma: no cover - soxr hiếm khi lỗi
+        logger.debug(f'[VieNeu] soxr resample lỗi ({exc}); thử torchaudio.')
+
+    try:  # pragma: no cover - torchaudio thường không được chạy tới
+        import torch
+        import torchaudio.functional as F
+
+        tensor = torch.from_numpy(samples)
+        out = F.resample(tensor, orig_freq=orig_sr, new_freq=target_sr)
+        return out.numpy().astype(np.float32, copy=False)
+    except Exception as exc:  # pragma: no cover
+        logger.debug(f'[VieNeu] torchaudio resample lỗi ({exc}); thử scipy.')
+
+    try:  # pragma: no cover
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        g = gcd(int(orig_sr), int(target_sr))
+        return resample_poly(samples, target_sr // g, orig_sr // g).astype(np.float32, copy=False)
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f'⚠️ [VieNeu] In-memory resample thất bại ({exc}); dùng ffmpeg.')
+        raise
+
+
+def _resample_via_ffmpeg(samples: np.ndarray, sample_rate: int, out_wav: Path) -> int:
+    """Fallback cuối: ghi WAV tạm rồi gọi FFmpeg (hành vi cũ)."""
+    import soundfile as sf
 
     with tempfile.TemporaryDirectory() as tmpd:
         raw = Path(tmpd) / 'raw.wav'
@@ -426,6 +570,40 @@ def _write_wav_resampled(samples: np.ndarray, sample_rate: int, out_wav: Path) -
             ],
             check=True,
         )
+    return _wav_duration_ms(out_wav)
+
+
+def _concat_waveforms(wavs: list[np.ndarray]) -> np.ndarray:
+    """Nối các waveform 1-D float32 của một câu (nhiều chunk) thành một mảng."""
+    arrays = [np.asarray(w, dtype=np.float32).reshape(-1) for w in wavs if w is not None]
+    if not arrays:
+        return np.zeros(0, dtype=np.float32)
+    if len(arrays) == 1:
+        return arrays[0]
+    return np.concatenate(arrays)
+
+
+def _write_silence_array(milliseconds: int = 200) -> np.ndarray:
+    """Mảng im lặng ``float32`` tại ``SAMPLE_RATE`` (dùng cho câu rỗng)."""
+    return np.zeros(int(SAMPLE_RATE * milliseconds / 1000.0), dtype=np.float32)
+
+
+def _write_wav_resampled(samples: np.ndarray, sample_rate: int, out_wav: Path) -> int:
+    """Write ``samples`` as mono 16-bit PCM at ``SAMPLE_RATE`` (in-memory resample)."""
+    import soundfile as sf
+
+    samples = np.asarray(samples)
+    if samples.ndim > 1:
+        samples = samples.reshape(-1)
+    if samples.size == 0:
+        return _write_silence(out_wav, milliseconds=200)
+
+    try:
+        resampled = _resample_waveform_in_memory(samples, sample_rate, SAMPLE_RATE)
+    except Exception:  # pragma: no cover - chỉ khi mọi backend trong RAM hỏng
+        return _resample_via_ffmpeg(samples, sample_rate, out_wav)
+
+    sf.write(str(out_wav), resampled, SAMPLE_RATE, subtype='PCM_16')
     return _wav_duration_ms(out_wav)
 
 

@@ -9,6 +9,7 @@ import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import edge_tts
+import numpy as np
 from core.models import Chapter
 from core.text_normalizer import markdown_to_segments
 
@@ -115,6 +116,93 @@ class EdgeTTSEngine(TTSEngine):
         return _wav_duration_ms(out_wav)
 
 
+def _float_to_pcm16(samples) -> bytes:
+    """Chuyển waveform float32 [-1, 1] sang PCM 16-bit little-endian."""
+    clipped = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def _silence_bytes(milliseconds: int) -> bytes:
+    frames = int(SAMPLE_RATE * (milliseconds / 1000.0))
+    return b'\x00\x00' * frames
+
+
+def _render_chapter_batched(
+    segments,
+    batch_fn,
+    wav_path: Path,
+    cues: list[SubtitleCue],
+) -> int:
+    """Render cả chương bằng một lời gọi batch GPU; ghép PCM trực tiếp trong RAM.
+
+    ``duration_ms`` của từng đoạn lấy từ waveform thực tế đã resample, nên
+    ``start_ms``/``end_ms`` khớp tuyệt đối với offset mẫu trong file WAV.
+    """
+    texts = [seg.text for seg in segments]
+    results = batch_fn(texts)
+    if len(results) != len(segments):
+        raise RuntimeError(
+            f'synthesize_segments_batch trả {len(results)} kết quả cho {len(segments)} đoạn.'
+        )
+
+    current_ms = 0
+    with wave.open(str(wav_path), 'wb') as out_wf:
+        out_wf.setnchannels(1)
+        out_wf.setsampwidth(2)
+        out_wf.setframerate(SAMPLE_RATE)
+        for seg, (waveform, seg_dur_ms) in zip(segments, results):
+            waveform = np.asarray(waveform, dtype=np.float32).reshape(-1)
+            out_wf.writeframes(_float_to_pcm16(waveform))
+            cues.append(
+                SubtitleCue(
+                    start_ms=current_ms,
+                    end_ms=current_ms + seg_dur_ms,
+                    text=seg.text,
+                )
+            )
+            current_ms += seg_dur_ms
+            if seg.pause_after_ms > 0:
+                out_wf.writeframes(_silence_bytes(seg.pause_after_ms))
+                current_ms += seg.pause_after_ms
+    return current_ms
+
+
+def _render_chapter_sequential(
+    segments,
+    engine: TTSEngine,
+    wav_path: Path,
+    cues: list[SubtitleCue],
+) -> int:
+    """Đường cũ: từng câu một qua ``synthesize_segment`` (Edge-TTS, engine lạ)."""
+    current_ms = 0
+    with tempfile.TemporaryDirectory() as tmpd:
+        tmp_dir = Path(tmpd)
+        with wave.open(str(wav_path), 'wb') as out_wf:
+            out_wf.setnchannels(1)
+            out_wf.setsampwidth(2)
+            out_wf.setframerate(SAMPLE_RATE)
+
+            for i, seg in enumerate(segments):
+                seg_wav = tmp_dir / f'seg_{i:04d}.wav'
+                seg_dur_ms = engine.synthesize_segment(seg.text, seg_wav)
+                with wave.open(str(seg_wav), 'rb') as in_wf:
+                    out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
+
+                cues.append(
+                    SubtitleCue(
+                        start_ms=current_ms,
+                        end_ms=current_ms + seg_dur_ms,
+                        text=seg.text,
+                    )
+                )
+                current_ms += seg_dur_ms
+
+                if seg.pause_after_ms > 0:
+                    out_wf.writeframes(_silence_bytes(seg.pause_after_ms))
+                    current_ms += seg.pause_after_ms
+    return current_ms
+
+
 def render_chapter(
     chapter: Chapter,
     engine: TTSEngine,
@@ -148,32 +236,13 @@ def render_chapter(
         f'🎙️ [TTS] Chương {chapter.index:03d} "{chapter.title}": Bắt đầu render {len(segments)} phân đoạn...'
     )
 
-    with tempfile.TemporaryDirectory() as tmpd:
-        tmp_dir = Path(tmpd)
-        with wave.open(str(wav_path), 'wb') as out_wf:
-            out_wf.setnchannels(1)
-            out_wf.setsampwidth(2)
-            out_wf.setframerate(SAMPLE_RATE)
-
-            for i, seg in enumerate(segments):
-                seg_wav = tmp_dir / f'seg_{i:04d}.wav'
-                seg_dur_ms = engine.synthesize_segment(seg.text, seg_wav)
-                with wave.open(str(seg_wav), 'rb') as in_wf:
-                    out_wf.writeframes(in_wf.readframes(in_wf.getnframes()))
-
-                cues.append(
-                    SubtitleCue(
-                        start_ms=current_ms,
-                        end_ms=current_ms + seg_dur_ms,
-                        text=seg.text,
-                    )
-                )
-                current_ms += seg_dur_ms
-
-                if seg.pause_after_ms > 0:
-                    silence_frames = int(SAMPLE_RATE * (seg.pause_after_ms / 1000.0))
-                    out_wf.writeframes(b'\x00\x00' * silence_frames)
-                    current_ms += seg.pause_after_ms
+    batch_fn = getattr(engine, 'synthesize_segments_batch', None)
+    if callable(batch_fn) and segments:
+        current_ms = _render_chapter_batched(
+            segments, batch_fn, wav_path, cues
+        )
+    else:
+        current_ms = _render_chapter_sequential(segments, engine, wav_path, cues)
 
     payload = {
         'chapter_index': chapter.index,
