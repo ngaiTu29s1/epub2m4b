@@ -79,3 +79,66 @@ def test_add_entry_noop_on_empty():
 def test_normalize_vi_text_uses_cache_for_math():
     out = normalize_vi_text('Theo E = mc^2 thì năng lượng rất lớn.')
     assert 'bình phương' in out
+
+
+# ---------------------------------------------------------------------------
+# System prompt: quy tắc viết tắt / giữ nguyên từ Anh / toán-hoá / định dạng
+# ---------------------------------------------------------------------------
+def test_system_prompt_covers_abbreviation_rules():
+    prompt = ln._SYSTEM_PROMPT
+    # Cặp viết tắt bắt buộc kèm cách đọc đúng.
+    for pair in [
+        ('OK', 'ô-kê'),
+        ('DNA', 'đi-en-ây'),
+        ('RNA', 'a-ren-ây'),
+        ('MC', 'em-xi'),
+        ('CEO', 'xi-i-ô'),
+        ('VIP', 'víp'),
+        ('PR', 'pi-a'),
+        ('KOL', 'kây-ô-en'),
+        ('ATM', 'ây-ti-em'),
+        ('GPS', 'giê-pê-ét'),
+        ('SOS', 'ét-o-ét'),
+        ('WIFI', 'oai-phai'),
+    ]:
+        assert pair[0] in prompt, f'prompt thiếu viết tắt {pair[0]}'
+        assert pair[1] in prompt, f'prompt thiếu cách đọc {pair[1]!r}'
+
+
+def test_system_prompt_forbids_wrong_readings():
+    prompt = ln._SYSTEM_PROMPT
+    assert 'o-ca' in prompt, 'prompt phải nói rõ KHÔNG đọc OK là o-ca'
+    assert 'đê-en-a' in prompt, 'prompt phải nói rõ KHÔNG đọc DNA là đê-en-a'
+    idx_ok = prompt.index("'OK' ->")
+    assert 'KHÔNG' in prompt[idx_ok:idx_ok + 120]
+
+
+def test_system_prompt_keeps_english_loanwords():
+    prompt = ln._SYSTEM_PROMPT
+    for word in ['video', 'camera', 'online', 'robot', 'internet', 'AI',
+                 'machine learning', 'live', 'stream', 'show', 'fan']:
+        assert word in prompt, f'prompt thiếu từ mượn {word!r}'
+    assert 'GIỮ NGUYÊN' in prompt
+    assert 'song ngữ' in prompt
+
+
+def test_system_prompt_covers_math_and_chemistry():
+    prompt = ln._SYSTEM_PROMPT
+    for pair in [('H2SO4', 'H hai S O bốn'),
+                 ('x^2', 'x bình phương'),
+                 ('1/2', 'một phần hai')]:
+        assert pair[0] in prompt
+        assert pair[1] in prompt
+
+
+def test_system_prompt_requires_plain_single_line_output():
+    prompt = ln._SYSTEM_PROMPT.lower()
+    assert 'duy nhất' in prompt
+    assert 'không markdown' in prompt
+    assert 'không xuống dòng' in prompt
+    assert 'không giải thích' in prompt
+
+
+def test_system_prompt_is_single_string_no_stray_newlines_in_rules():
+    assert isinstance(ln._SYSTEM_PROMPT, str)
+    assert ln._SYSTEM_PROMPT.strip()

@@ -1061,7 +1061,8 @@ ABBREVIATION_PRONUNCIATIONS: dict[str, str] = {
     'KOL': 'kây-ô-en',
     'AI': 'ây-ai',
     'ATM': 'ây-ti-em',
-    'DNA': 'đê-en-a',
+    # DNA đọc là "đi-en-ây" (đánh vần tiếng Anh), KHÔNG phải "đê-en-a".
+    'DNA': 'đi-en-ây',
     'DJ': 'đi-giê',
     'TV': 'ti-vi',
     'FB': 'phây-bút',
@@ -1070,6 +1071,8 @@ ABBREVIATION_PRONUNCIATIONS: dict[str, str] = {
     'SOS': 'ét-o-ét',
     'IQ': 'ai-kiu',
     'EQ': 'i-kiu',
+    # OC đọc là "ô-xi", tuyệt đối KHÔNG đọc "o-ca".
+    'OC': 'ô-xi',
     'WC': 'vê-xê',
     'SIM': 'xim',
     'WIFI': 'oai-phai',
@@ -1078,6 +1081,14 @@ ABBREVIATION_PRONUNCIATIONS: dict[str, str] = {
     'IT': 'ai-ti',
     'HR': 'ếch-a',
     'VAT': 'vát',
+    # Song ngữ thông dụng khác hay gặp trong sách báo tiếng Việt.
+    'ODA': 'ô-đê-a',
+    'GDP': 'giê-đê-pê',
+    'WHO': 'đắp-biu-ây-chi-ô',
+    'UNESCO': 'u-nét-xcô',
+    'FIFA': 'phi-pha',
+    'NBA': 'en-bi-ây',
+    'OK': 'ô-kê',
 }
 
 # Bảng chữ cái tiếng Việt dùng khi đánh vần viết tắt lạ (VTV → vê-tê-vê).

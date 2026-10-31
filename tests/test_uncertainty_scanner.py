@@ -286,7 +286,7 @@ def test_sentence_at_helper_handles_empty_and_missing_token():
     ('KOL', 'kây-ô-en'),
     ('AI', 'ây-ai'),
     ('ATM', 'ây-ti-em'),
-    ('DNA', 'đê-en-a'),
+    ('DNA', 'đi-en-ây'),
     ('DJ', 'đi-giê'),
     ('TV', 'ti-vi'),
     ('FB', 'phây-bút'),
@@ -296,6 +296,12 @@ def test_sentence_at_helper_handles_empty_and_missing_token():
     ('IQ', 'ai-kiu'),
     ('EQ', 'i-kiu'),
     ('WC', 'vê-xê'),
+    ('OC', 'ô-xi'),
+    ('ODA', 'ô-đê-a'),
+    ('WHO', 'đắp-biu-ây-chi-ô'),
+    ('UNESCO', 'u-nét-xcô'),
+    ('FIFA', 'phi-pha'),
+    ('OK', 'ô-kê'),
     ('SIM', 'xim'),
     ('WIFI', 'oai-phai'),
     ('KPI', 'kây-pi-ai'),
@@ -339,3 +345,14 @@ def test_unknown_abbr_span_gets_pronunciation_suggestion():
 def test_known_abbreviation_whitelist_still_silent():
     """VTV/VOV nằm trong whitelist quen thuộc: không flag, không nhiễu UI."""
     assert detect_uncertain_spans('VTV phát sóng.') == []
+
+
+@pytest.mark.parametrize('token, wrong', [
+    ('OC', 'o-ca'),
+    ('DNA', 'đê-en-a'),
+])
+def test_corrected_pronunciations(token, wrong):
+    """OC = ô-xi (không phải "o-ca"), DNA = đi-en-ây (không phải "đê-en-a")."""
+    reading = suggest_abbreviation_reading(token)
+    assert reading != wrong
+    assert reading == {'OC': 'ô-xi', 'DNA': 'đi-en-ây'}[token]

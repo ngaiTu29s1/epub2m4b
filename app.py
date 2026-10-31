@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 import gradio as gr
 from core.abs_client import ABSClient, load_env_file
+from core import llm_normalizer
 from core.epub_parser import export_book_markdown, parse_book_markdown, parse_epub
 from core.m4b_packager import export_webvtt, package_m4b
 from core.models import BookMetadata, Chapter
@@ -74,6 +75,149 @@ def _one_line_snippet(sentence: str, token: str, limit: int = 120) -> str:
     if room > 0:
         body = body[:room]
     return f'{prefix}{body}{suffix}'
+
+
+def _abbr_pattern(token: str) -> str:
+    """Regex thay thế chính xác một token, không nuốt từ con.
+
+    Token thuần chữ cái (MC, DNA) dùng ranh giới từ để ``MC`` không thay vào
+    ``MCSA``. Token có ký tự đặc biệt (``x^2``, ``1/2``, ``H2SO4``) khớp nguyên
+    văn vì ranh giới từ không có nghĩa ở đó.
+    """
+    if re.fullmatch(r'[^\W\d_]+', token, flags=re.UNICODE):
+        return rf'(?<![^\W\d_]){re.escape(token)}(?![^\W\d_])'
+    return re.escape(token)
+
+
+def apply_uncertainty_suggestions(
+    rows: list[list[str]] | None,
+    md_text: str,
+    state: dict | None = None,
+) -> tuple[dict, str, str]:
+    """Áp cách đọc đã sửa trong bảng Điểm nghi vấn vào kịch bản.
+
+    Mỗi hàng: ``[Từ / Ký hiệu, Phân loại, Ngữ cảnh, Đề xuất phát âm]``.
+    Hàng có đề xuất rỗng hoặc trùng y token bị bỏ qua.
+
+    Trả ``(state, md_mới, thông_báo)`` để cập nhật cả ``md_editor`` lẫn
+    ``state['chapters']``.
+    """
+    rows = list(rows or [])
+    text = md_text or ''
+
+    # Gom đề xuất theo token (giữ thứ tự trong bảng, bỏ trùng/rỗng/không đổi).
+    suggestions: dict[str, str] = {}
+    for row in rows:
+        if not row or len(row) < 4:
+            continue
+        token = str(row[0] or '').strip()
+        suggestion = str(row[3] or '').strip()
+        if not token or not suggestion or token == suggestion:
+            continue
+        suggestions.setdefault(token, suggestion)
+
+    applied: list[str] = []
+    total = 0
+    for token, suggestion in suggestions.items():
+        text, count = re.subn(_abbr_pattern(token), lambda _m, s=suggestion: s, text)
+        if count:
+            applied.append(token)
+            total += count
+
+    if state and 'chapters' in state and total:
+        for ch in state['chapters']:
+            ch_md = ch.get('markdown', '')
+            if not ch_md:
+                continue
+            new_ch = ch_md
+            for token, suggestion in suggestions.items():
+                new_ch = re.sub(
+                    _abbr_pattern(token), lambda _m, s=suggestion: s, new_ch
+                )
+            if new_ch != ch_md:
+                ch['markdown'] = new_ch
+        state['uncertainty_rows'] = extract_uncertainty_rows(state)
+
+    if total:
+        detail = ', '.join(f'`{t}`' for t in applied[:8])
+        more = f' … (+{len(applied) - 8} từ)' if len(applied) > 8 else ''
+        message = (
+            f'✅ Đã áp dụng **{total}** chỗ vào kịch bản cho '
+            f'{len(applied)} từ/ký hiệu: {detail}{more}.'
+        )
+    else:
+        message = 'ℹ️ Không có thay đổi nào để áp dụng (đề xuất trống hoặc trùng từ gốc).'
+
+    return (state or {}), text, message
+
+
+def _extract_reading(answer: str, token: str, context: str) -> str:
+    """Rút cách đọc của ``token`` từ câu LLM trả về. Rỗng nếu không xác định.
+
+    LLM nhận cả câu và có thể trả:
+    * cả câu đã chuẩn hoá → diff ký tự để cô lập đúng đoạn thay của ``token``;
+    * gọn đúng cụm phiên âm (``em-xi``) → dùng luôn.
+    """
+    cleaned = re.sub(r'\s+', ' ', str(answer or '').strip()).strip('"\'` ')
+    if not cleaned or not token:
+        return ''
+
+    original = re.sub(r'\s+', ' ', str(context or '').strip()) or token
+    # Coi là "cả câu đã chuẩn hoá" khi độ dài tương đương câu gốc — lúc đó phải
+    # diff để tách riêng cụm phiên âm. Trả gọn ('em-xi') thì ngắn hơn hẳn.
+    looks_like_sentence = len(cleaned) >= max(8, len(original) * 0.5)
+    if looks_like_sentence:
+        return llm_normalizer._guess_spoken(original, cleaned, token) or ''
+    return cleaned
+
+
+def ai_resolve_uncertainty(
+    rows: list[list[str]] | None,
+    state: dict | None = None,
+) -> tuple[list[list[str]], str]:
+    """Dùng LLM điền 'Đề xuất phát âm' tối ưu theo ngữ cảnh câu.
+
+    Trả ``(bảng_mới, thông_báo)``. Chưa cấu hình ``LLM_API_KEY`` thì trả nguyên
+    bảng kèm cảnh báo (không raise, không làm hỏng UI).
+    """
+    table = [list(r) for r in (rows or [])]
+    if not table:
+        return table, 'ℹ️ Bảng đang trống — hãy bấm "Quét lại điểm nghi vấn" trước.'
+
+    if not llm_normalizer.llm_available():
+        return table, '⚠️ Chưa cấu hình LLM_API_KEY trong .env'
+
+    resolved = 0
+    failed = 0
+    for row in table:
+        if len(row) < 4:
+            continue
+        token = str(row[0] or '').strip()
+        if not token:
+            continue
+        context = str(row[2] or '').strip()
+        try:
+            answer = llm_normalizer._call_llm(context or token)
+        except Exception as exc:  # pragma: no cover - phòng thủ
+            logger.warning(f'⚠️ [AI RESOLVE] Lỗi gọi LLM cho {token!r}: {exc}')
+            answer = None
+        if not answer:
+            failed += 1
+            continue
+        reading = _extract_reading(answer, token, context)
+        if reading:
+            row[3] = reading
+            resolved += 1
+        else:
+            failed += 1
+
+    if resolved:
+        msg = f'✅ AI đã điền gợi ý phát âm cho **{resolved}** từ/ký hiệu.'
+        if failed:
+            msg += f' ({failed} mục không xử lý được.)'
+    else:
+        msg = '⚠️ AI không trả về gợi ý nào. Kiểm tra lại LLM_API_KEY / LLM_BASE_URL.'
+    return table, msg
 
 
 def extract_uncertainty_rows(state: dict) -> list[list[str]]:
@@ -693,11 +837,22 @@ def build_app() -> gr.Blocks:
                             headers=['Từ / Ký hiệu', 'Phân loại', 'Ngữ cảnh trong câu', 'Đề xuất phát âm'],
                             datatype=['str', 'str', 'str', 'str'],
                             label='Danh sách điểm cần chú ý',
-                            interactive=False,
+                            # Chỉ cột "Đề xuất phát âm" cho sửa trực tiếp (nhấp đúp).
+                            interactive=True,
+                            static_columns=[0, 1, 2],
                         )
-                        refresh_uncertainty_btn = gr.Button(
-                            '🔄 Quét lại điểm nghi vấn theo các chương đã chọn', size='sm', variant='secondary'
-                        )
+                        with gr.Row():
+                            refresh_uncertainty_btn = gr.Button(
+                                '🔄 Quét lại điểm nghi vấn theo các chương đã chọn',
+                                size='sm', variant='secondary',
+                            )
+                            ai_resolve_btn = gr.Button(
+                                '🤖 AI gợi ý phát âm (LLM)', size='sm', variant='secondary'
+                            )
+                            apply_uncertainty_btn = gr.Button(
+                                '✅ Áp dụng cách đọc vào kịch bản', size='sm', variant='primary'
+                            )
+                        apply_uncertainty_status = gr.Markdown()
 
                 # KHU VỰC 2
                 with gr.Group():
@@ -887,6 +1042,16 @@ def build_app() -> gr.Blocks:
             fn=extract_uncertainty_rows,
             inputs=[state],
             outputs=[uncertainty_table],
+        )
+        ai_resolve_btn.click(
+            fn=ai_resolve_uncertainty,
+            inputs=[uncertainty_table, state],
+            outputs=[uncertainty_table, apply_uncertainty_status],
+        )
+        apply_uncertainty_btn.click(
+            fn=apply_uncertainty_suggestions,
+            inputs=[uncertainty_table, md_editor, state],
+            outputs=[state, md_editor, apply_uncertainty_status],
         )
         abs_test_btn.click(
             fn=handle_test_abs_connection,

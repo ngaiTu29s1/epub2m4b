@@ -292,3 +292,197 @@ def test_create_tts_engine_keeps_clone_and_classic_routing(monkeypatch):
 
     app._create_tts_engine('VieNeu-TTS v3 Turbo', 'Nguyễn Ngọc Ngạn (kinh điển)', 0)
     assert captured['mode'] == 'classic'
+
+
+# ---------------------------------------------------------------------------
+# Áp dụng cách đọc đã sửa vào kịch bản (nút "Áp dụng")
+# ---------------------------------------------------------------------------
+def test_apply_uncertainty_replaces_and_updates_markdown():
+    md = 'Anh ấy là MC của đêm nhạc. CEO đứng cạnh.'
+    rows = [['MC', 'Từ viết tắt lạ', 'Anh ấy là MC của đêm nhạc.', 'em-xi'],
+            ['CEO', 'Từ viết tắt lạ', 'CEO đứng cạnh.', 'xi-i-ô']]
+    _st, out, msg = app.apply_uncertainty_suggestions(rows, md)
+    assert 'MC' not in out and 'CEO' not in out
+    assert 'em-xi' in out and 'xi-i-ô' in out
+    assert 'áp dụng' in msg.lower()
+    assert 'MC' in msg and 'CEO' in msg
+
+
+def test_apply_uncertainty_respects_word_boundaries():
+    """'MC' không được thay vào trong 'MCSA'."""
+    md = 'Anh là MC. MCSA là tổ chức khác.'
+    _st, out, _msg = app.apply_uncertainty_suggestions(
+        [['MC', 'Từ viết tắt lạ', 'ctx', 'em-xi']], md
+    )
+    assert 'em-xi' in out
+    assert 'MCSA' in out, f'MCSA bị thay nhầm: {out!r}'
+    assert 'em-xiSA' not in out
+
+
+def test_apply_uncertainty_handles_special_tokens():
+    md = 'Ta có x^2 và 1/2 cốc.'
+    _st, out, _msg = app.apply_uncertainty_suggestions(
+        [['x^2', 'Biểu thức toán học', 'ctx', 'ích mũ hai'],
+         ['1/2', 'Phân số', 'ctx', 'một phần hai']],
+        md,
+    )
+    assert out == 'Ta có ích mũ hai và một phần hai cốc.'
+
+
+def test_apply_uncertainty_skips_empty_and_identical_suggestions():
+    md = 'Anh là MC. VIP khác.'
+    rows = [['MC', 'a', 'ctx', ''],          # rỗng
+            ['VIP', 'a', 'ctx', 'VIP'],      # trùng từ gốc
+            ['X', 'a', 'ctx']]               # thiếu cột
+    st, out, msg = app.apply_uncertainty_suggestions(rows, md)
+    assert out == md
+    assert 'Không có thay đổi' in msg
+
+
+def test_apply_uncertainty_handles_none_inputs():
+    st, out, msg = app.apply_uncertainty_suggestions(None, '')
+    assert out == ''
+    assert 'Không có thay đổi' in msg
+    assert isinstance(st, dict)
+
+
+def test_apply_uncertainty_updates_chapter_state():
+    md = 'Anh ấy là MC.'
+    state = {'chapters': [{'enabled': True, 'markdown': md}, {'enabled': False, 'markdown': ''}]}
+    st, out, _msg = app.apply_uncertainty_suggestions(
+        [['MC', 'a', 'ctx', 'em-xi']], md, state
+    )
+    assert out == 'Anh ấy là em-xi.'
+    assert st['chapters'][0]['markdown'] == 'Anh ấy là em-xi.'
+    assert 'uncertainty_rows' in st
+
+
+def test_apply_uncertainty_counts_only_real_replacements():
+    md = 'MC và MC, nhưng không có CEO.'
+    st, out, msg = app.apply_uncertainty_suggestions(
+        [['MC', 'a', 'ctx', 'em-xi'], ['CEO', 'a', 'ctx', 'xi-i-ô'],
+         ['VIP', 'a', 'ctx', 'víp']], md
+    )
+    assert '**3**' in msg, msg  # MC x2 + CEO x1; VIP không xuất hiện
+    assert '2 từ/ký hiệu' in msg
+    assert 'víp' not in out
+
+
+def test_uncertainty_table_is_editable_only_for_suggestion_column():
+    """Cấu hình UI: bảng cho sửa (interactive) nhưng khoá 3 cột đầu."""
+    src = Path(app.__file__).read_text(encoding='utf-8')
+    idx = src.index('uncertainty_table = gr.Dataframe(')
+    block = src[idx:idx + 700]
+    assert 'interactive=True' in block
+    assert 'static_columns=[0, 1, 2]' in block
+    assert 'apply_uncertainty_btn' in src
+
+
+def test_apply_button_is_wired_to_handler():
+    src = Path(app.__file__).read_text(encoding='utf-8')
+    assert 'fn=apply_uncertainty_suggestions' in src
+    assert 'apply_uncertainty_status' in src
+
+
+# ---------------------------------------------------------------------------
+# AI gợi ý phát âm (mock LLM, không gọi mạng)
+# ---------------------------------------------------------------------------
+def _rows():
+    return [
+        ['MC', 'Từ viết tắt lạ', 'Anh ấy là MC của đêm nhạc.', 'MC'],
+        ['CEO', 'Từ viết tắt lạ', 'CEO đứng cạnh MC.', 'CEO'],
+    ]
+
+
+def test_ai_resolve_without_key_returns_warning(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: False)
+    table, msg = app.ai_resolve_uncertainty(_rows())
+    assert 'Chưa cấu hình LLM_API_KEY' in msg
+    assert '⚠️' in msg
+    # Bảng trả nguyên vẹn.
+    assert [r[3] for r in table] == ['MC', 'CEO']
+
+
+def test_ai_resolve_fills_readings_from_full_sentence(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+    monkeypatch.setattr(
+        llm_normalizer, '_call_llm',
+        lambda prompt, **kw: prompt.replace('MC', 'em-xi').replace('CEO', 'xi-i-ô'),
+    )
+    table, msg = app.ai_resolve_uncertainty(_rows())
+    assert table[0][3] == 'em-xi'
+    assert table[1][3] == 'xi-i-ô'
+    assert '**2**' in msg
+
+
+def test_ai_resolve_accepts_compact_reading(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+    monkeypatch.setattr(llm_normalizer, '_call_llm', lambda prompt, **kw: 'em-xi')
+    table, msg = app.ai_resolve_uncertainty([['MC', 'x', 'Anh ấy là MC.', 'MC']])
+    assert table[0][3] == 'em-xi'
+
+
+def test_ai_resolve_passes_context_to_llm(monkeypatch):
+    from core import llm_normalizer
+    seen = []
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+
+    def spy(prompt, **kw):
+        seen.append(prompt)
+        return 'em-xi'
+
+    monkeypatch.setattr(llm_normalizer, '_call_llm', spy)
+    app.ai_resolve_uncertainty(_rows())
+    assert 'Anh ấy là MC của đêm nhạc.' in seen[0], seen
+
+
+def test_ai_resolve_handles_llm_errors_gracefully(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+
+    def boom(prompt, **kw):
+        raise RuntimeError('network down')
+
+    monkeypatch.setattr(llm_normalizer, '_call_llm', boom)
+    table, msg = app.ai_resolve_uncertainty(_rows())
+    assert 'không trả về gợi ý' in msg
+    assert [r[3] for r in table] == ['MC', 'CEO']
+
+
+def test_ai_resolve_ignores_unchanged_answer(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+    monkeypatch.setattr(
+        llm_normalizer, '_call_llm', lambda prompt, **kw: 'Anh ấy là MC của đêm nhạc.'
+    )
+    table, msg = app.ai_resolve_uncertainty([['MC', 'x', 'Anh ấy là MC của đêm nhạc.', 'MC']])
+    assert table[0][3] == 'MC', 'không được ghi đè bằng câu không đổi'
+    assert 'không trả về gợi ý' in msg
+
+
+def test_ai_resolve_empty_table(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+    table, msg = app.ai_resolve_uncertainty([])
+    assert table == []
+    assert 'trống' in msg
+
+
+def test_ai_resolve_does_not_mutate_input_rows(monkeypatch):
+    from core import llm_normalizer
+    monkeypatch.setattr(llm_normalizer, 'llm_available', lambda: True)
+    monkeypatch.setattr(llm_normalizer, '_call_llm', lambda prompt, **kw: 'em-xi')
+    original = _rows()
+    snapshot = [list(r) for r in original]
+    app.ai_resolve_uncertainty(original)
+    assert original == snapshot
+
+
+def test_ai_resolve_button_is_wired():
+    src = Path(app.__file__).read_text(encoding='utf-8')
+    assert 'ai_resolve_btn' in src
+    assert 'fn=ai_resolve_uncertainty' in src
+    assert '🤖 AI gợi ý phát âm (LLM)' in src
