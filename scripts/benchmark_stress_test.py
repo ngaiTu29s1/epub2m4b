@@ -85,6 +85,9 @@ def _wer(reference: str, hypothesis: str) -> float:
 
 def _render(normalized: str) -> tuple[Path, float]:
     OUT_WAV.parent.mkdir(parents=True, exist_ok=True)
+    if OUT_WAV.exists():
+        OUT_WAV.unlink()
+        logger.info(f'🗑️ [Render] Đã xoá preview audio cũ: {OUT_WAV.name}')
     engine = VieNeuEngine(mode='preset', voice='Phạm Tuyên')
     logger.info(
         f'🎙️ [Render] batch_size={engine.batch_size}, device=auto. '
