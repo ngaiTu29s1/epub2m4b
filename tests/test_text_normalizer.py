@@ -87,13 +87,25 @@ def test_normalizer_context_aware_rules():
     assert 'mười lăm' in normalize_vi_text('15')
 
 
-def test_normalizer_abbr_and_loanwords():
+def test_normalizer_abbr_and_place_names():
     assert 'Thành phố Hồ Chí Minh' in normalize_vi_text('TP.HCM')
     assert 'Hà Nội' in normalize_vi_text('HN')
     assert 'Nhà xuất bản' in normalize_vi_text('NXB')
-    assert 'in-tơ-nét' in normalize_vi_text('Internet')          # noqa: RUF001
-    assert 'rô-bốt' in normalize_vi_text('robot')
-    assert 'ca-mê-ra' in normalize_vi_text('camera')
-    assert 'Niu Óoc' in normalize_vi_text('New York')
+    # Địa danh có âm Hán-Việt chuẩn vẫn được Việt hoá.
+    assert 'Bắc Kinh' in normalize_vi_text('Beijing')
     assert 'Luân Đôn' in normalize_vi_text('London')
+    assert 'Niu Óoc' in normalize_vi_text('New York')
+
+
+def test_english_loanwords_are_preserved_for_bilingual_engine():
+    """Từ mượn tiếng Anh KHÔNG bị phiên âm bồi (spec v3)."""
+    for word in ('video', 'camera', 'online', 'robot', 'internet', 'website',
+                 'email', 'data', 'radio', 'logic', 'computer', 'software',
+                 'hardware', 'smartphone'):
+        assert normalize_vi_text(word) == word
+    # Trong câu cũng giữ nguyên chữ tiếng Anh.
+    mixed = normalize_vi_text('Machine Learning và AI online qua video call.')
+    assert 'Machine Learning' in mixed
+    assert 'video' in mixed
+
 

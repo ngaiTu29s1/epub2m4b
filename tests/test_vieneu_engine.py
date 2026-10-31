@@ -147,3 +147,45 @@ def test_list_available_preset_voices_falls_back_offline(monkeypatch):
     monkeypatch.setattr(vieneu_engine, 'load_vieneu_model', boom)
     voices = vieneu_engine.list_available_preset_voices()
     assert len(voices) == len(vieneu_engine.FALLBACK_PRESET_VOICES)
+
+
+def test_batch_size_default_on_cuda(monkeypatch):
+    """Trên CUDA, batch_size mặc định = DEFAULT_BATCH_SIZE_CUDA."""
+    monkeypatch.setattr(vieneu_engine, '_available_device', lambda: 'cuda')
+    engine = VieNeuEngine(device='cuda')
+    assert engine.batch_size == vieneu_engine.DEFAULT_BATCH_SIZE_CUDA
+
+
+def test_batch_size_default_on_cpu(monkeypatch):
+    """Trên CPU, batch_size mặc định = 1 (chạy tuần tự)."""
+    monkeypatch.setattr(vieneu_engine, '_available_device', lambda: 'cpu')
+    engine = VieNeuEngine(device='cpu')
+    assert engine.batch_size == 1
+
+
+def test_batch_size_explicit_overrides_default():
+    engine = VieNeuEngine(device='cuda', batch_size=6)
+    assert engine.batch_size == 6
+
+
+def test_batch_size_never_below_one():
+    engine = VieNeuEngine(device='cuda', batch_size=0)
+    assert engine.batch_size == 1
+
+
+def test_batch_size_forwarded_to_infer(monkeypatch, tmp_path: Path):
+    """``batch_size`` phải được truyền vào ``tts.infer``."""
+    captured: dict = {}
+
+    class _FakeTTS:
+        sample_rate = 24000
+
+        def infer(self, text, **kwargs):
+            captured.update(kwargs)
+            return np.zeros(2400, dtype=np.float32)
+
+    monkeypatch.setattr(vieneu_engine, 'load_vieneu_model', lambda *a, **k: _FakeTTS())
+    engine = VieNeuEngine(mode='preset', voice='Bình', device='cuda', batch_size=4)
+    engine.synthesize_segment('Xin chào', tmp_path / 'out.wav')
+    assert captured.get('batch_size') == 4
+

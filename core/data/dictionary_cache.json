@@ -1,0 +1,54 @@
+{
+  "_meta": {
+    "version": 1,
+    "description": "Persistent Dynamic Cache cho Self-Enriching Hybrid Normalizer. Khoá là thuật ngữ gốc (chuẩn hoá lowercase), giá trị là phiên âm/lời đọc tiếng Việt.",
+    "seeded": true
+  },
+  "entries": {
+    "h2so4": {
+      "spoken": "H hai S O bốn",
+      "aliases": ["axit sunfuric"],
+      "kind": "chemical"
+    },
+    "co2": {
+      "spoken": "C O hai",
+      "aliases": ["các-bon đi-ô-xít"],
+      "kind": "chemical"
+    },
+    "nacl": {
+      "spoken": "N A C L",
+      "aliases": ["muối ăn"],
+      "kind": "chemical"
+    },
+    "kmno4": {
+      "spoken": "K M N O bốn",
+      "aliases": ["kali pemanganat"],
+      "kind": "chemical"
+    },
+    "h2o": {
+      "spoken": "H hai O",
+      "aliases": ["nước"],
+      "kind": "chemical"
+    },
+    "e = mc^2": {
+      "spoken": "E bằng m c bình phương",
+      "aliases": [],
+      "kind": "math"
+    },
+    "e=mc^2": {
+      "spoken": "E bằng m c bình phương",
+      "aliases": [],
+      "kind": "math"
+    },
+    "x^2 + y^2 = z^2": {
+      "spoken": "x bình phương cộng y bình phương bằng z bình phương",
+      "aliases": [],
+      "kind": "math"
+    },
+    "x^2 + 2x + 1 = 0": {
+      "spoken": "x bình phương cộng hai x cộng một bằng không",
+      "aliases": [],
+      "kind": "math"
+    }
+  }
+}

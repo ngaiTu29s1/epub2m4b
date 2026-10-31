@@ -9,6 +9,7 @@ import unicodedata
 import warnings
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from core.models import AudioSegmentSpec
+from core.llm_normalizer import enrich_and_normalize
 
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
 # ---------------------------------------------------------------------------
@@ -201,11 +202,14 @@ def _normalize_short_date(text: str) -> str:
 
     def repl(m: re.Match) -> str:
         day, month = int(m.group(1)), int(m.group(2))
+        # Phân số đơn giản "3/4", "1/2" là phân số, không phải ngày tháng.
+        if m.group(1).isdigit() and m.group(2).isdigit() and day < month <= 12:
+            return m.group(0)
         if 1 <= day <= 31 and 1 <= month <= 12:
             return f'{_day_to_words(day)} tháng {_month_words(month)}'
         return m.group(0)
 
-    return re.sub(r'\b(\d{1,2})/(\d{1,2})\b', repl, text)
+    return re.sub(r'(?<![\d/])\b(\d{1,2})/(\d{1,2})\b(?![\d/])', repl, text)
 
 
 def _normalize_standalone_year(text: str) -> str:
@@ -275,6 +279,22 @@ def _normalize_clock(text: str) -> str:
     return text
 
 
+_FRACTION_DEN_WORDS = {2: 'hai', 3: 'ba', 4: 'tư', 5: 'năm', 6: 'sáu', 8: 'tám', 10: 'mười'}
+_FRACTION_RE = re.compile(r'(?<![\d/.,])\b(\d{1,3})/(\d{1,3})\b(?![\d/])')
+
+
+def _normalize_fraction(text: str) -> str:
+    """``3/4`` → "ba phần tư"; ``1/2`` → "một phần hai"."""
+
+    def repl(m: re.Match) -> str:
+        num, den = int(m.group(1)), int(m.group(2))
+        if den < 2 or num < 1:
+            return m.group(0)
+        return f'{number_to_words_vi(num)} phần {_FRACTION_DEN_WORDS.get(den, number_to_words_vi(den))}'
+
+    return _FRACTION_RE.sub(repl, text)
+
+
 def _normalize_number_range(text: str) -> str:
     """``6-7 mét`` / ``10 - 20`` → "sáu đến bảy mét" (giữ nguyên đơn vị đi kèm)."""
 
@@ -317,6 +337,14 @@ _CUBIC_METERS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*m\s*3\b', re.IGNORECASE)
 _PERCENT_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*%')
 _CURRENCY_RE = re.compile(r'\b(\d[\d.,]*)\s*(?:đ|vnđ|vnd|đồng)\b', re.IGNORECASE)
 _CELSIUS_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:°\s*c|độ\s*c)\b', re.IGNORECASE)
+_CELSIUS_WORD_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*độ\s+[cCkK]\b')
+_SIMPLE_CELSIUS_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*°')
+_GHZ_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*GHz\b', re.IGNORECASE)
+_MHZ_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*MHz\b', re.IGNORECASE)
+_KM_PER_H_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*km\s*/\s*h\b', re.IGNORECASE)
+_M_PER_S_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*m\s*/\s*s\b', re.IGNORECASE)
+_KWH_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*kWh\b', re.IGNORECASE)
+_KM_PER_H_WORD_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*ki-lô-mét\s*/\s*giờ\b', re.IGNORECASE)
 
 
 def _read_number_literal(literal: str) -> str:
@@ -364,6 +392,21 @@ def _normalize_measurements(text: str) -> str:
     text = _DECIMAL_METERS_RE.sub(
         lambda m: f'{_read_number_literal(m.group(1))} mét', text
     )
+    # Đơn vị tốc độ / tần số / năng lượng trước các đơn vị "trần" bên dưới.
+    text = _KM_PER_H_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} ki-lô-mét trên giờ', text
+    )
+    text = _KM_PER_H_WORD_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} ki-lô-mét trên giờ', text
+    )
+    text = _M_PER_S_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} mét trên giây', text
+    )
+    text = _GHZ_RE.sub(lambda m: f'{_read_number_literal(m.group(1))} giga héc', text)
+    text = _MHZ_RE.sub(lambda m: f'{_read_number_literal(m.group(1))} mê-ga héc', text)
+    text = _KWH_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} ki-lô-oát giờ', text
+    )
     text = _CENTIMETERS_RE.sub(
         lambda m: f'{_read_number_literal(m.group(1))} xăng-ti-mét', text
     )
@@ -379,6 +422,12 @@ def _normalize_measurements(text: str) -> str:
     text = _CELSIUS_RE.sub(
         lambda m: f'{_read_number_literal(m.group(1))} độ xê', text
     )
+    text = _CELSIUS_WORD_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} độ xê', text
+    )
+    text = _SIMPLE_CELSIUS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} độ', text
+    )
     return text
 
 
@@ -388,7 +437,10 @@ def _normalize_measurements(text: str) -> str:
 _ABBR_MAP = [
     (re.compile(r'\bTP\.?\s*HCM\b', re.IGNORECASE), 'Thành phố Hồ Chí Minh'),
     (re.compile(r'\bTp\.?\s*HCM\b'), 'Thành phố Hồ Chí Minh'),
-    (re.compile(r'\bHCM\b'), 'Hồ Chí Minh'),
+    # "TP. HCM" / "TP.HCM": xử lý trước mọi luật "TP." để không còn "H" mồ côi.
+    (re.compile(r'\bTP\.\s*HCM\b', re.IGNORECASE), 'Thành phố Hồ Chí Minh'),
+    (re.compile(r'\bTP\.?\s+CN\b'), 'Thành phố Cần Thơ'),
+    (re.compile(r'(?<![\w.])HCM\b'), 'Hồ Chí Minh'),
     (re.compile(r'\bHN\b'), 'Hà Nội'),
     (re.compile(r'\bĐH\b'), 'Đại học'),
     (re.compile(r'\bNXB\b'), 'Nhà xuất bản'),
@@ -399,6 +451,21 @@ _ABBR_MAP = [
     (re.compile(r'\bTS\.\s'), 'Tiến sĩ '),
     (re.compile(r'\bThS\.\s'), 'Thạc sĩ '),
     (re.compile(r'\bBS\.\s'), 'Bác sĩ '),
+    # Tổ chức / cơ quan chính thức của Việt Nam (chữ viết tắt đọc liền, không
+    # đánh vần từng chữ như engine G2P sẽ làm với một chuỗi in hoa).
+    (re.compile(r'\bUBND\b'), 'Uỷ ban nhân dân'),
+    (re.compile(r'\bHĐND\b'), 'Hội đồng nhân dân'),
+    (re.compile(r'\bTHPT\b'), 'Trung học phổ thông'),
+    (re.compile(r'\bTHCS\b'), 'Trung học cơ sở'),
+    (re.compile(r'\bDNNN\b'), 'Doanh nghiệp nhà nước'),
+]
+# Viết tắt tổ chức quốc tế đọc quen thuộc trong tiếng Việt.
+_ORG_ABBR_MAP = [
+    (re.compile(r'\bUNESCO\b'), 'U N E S C O'),
+    (re.compile(r'\bWHO\b'), 'W H O'),
+    (re.compile(r'\bCOVID\s*-?\s*19\b', re.IGNORECASE), 'Cô-vít mười chín'),
+    (re.compile(r'\bADN\b'), 'A D N'),
+    (re.compile(r'\bGDP\b'), 'G D P'),
 ]
 # Viết tắt cần khoảng trắng/ranh giới phía sau để không cắn vào tên riêng.
 _ABBR_TAIL = [
@@ -410,60 +477,22 @@ _ABBR_TAIL = [
     (re.compile(r'\bTS\.\b'), 'Tiến sĩ'),
 ]
 
-# Phiên âm từ ngoại lai thường gặp (đọc theo âm Việt).
-_LOANWORD_MAP = [
-    (re.compile(r'\bInternet\b', re.IGNORECASE), 'in-tơ-nét'),
-    (re.compile(r'\brobot\b', re.IGNORECASE), 'rô-bốt'),
-    (re.compile(r'\bcamera\b', re.IGNORECASE), 'ca-mê-ra'),
-    (re.compile(r'\bNew York\b', re.IGNORECASE), 'Niu Óoc'),
-    (re.compile(r'\bLondon\b', re.IGNORECASE), 'Luân Đôn'),
-    (re.compile(r'\bParis\b', re.IGNORECASE), 'Pa-ri'),
-    (re.compile(r'\bWashington\b', re.IGNORECASE), 'Oa-sinh-tơn'),
-    (re.compile(r'\bTokyo\b', re.IGNORECASE), 'Tô-ky-ô'),
-    (re.compile(r'\bMoscow\b', re.IGNORECASE), 'Mát-xcơ-va'),
-]
-
 # ---------------------------------------------------------------------------
-# Từ tiếng Anh / tên riêng / địa danh phổ biến -> phiên âm Việt hoá tự nhiên
+# Địa danh / tên riêng có âm Hán-Việt chuẩn (đọc tự nhiên trong tiếng Việt).
 # ---------------------------------------------------------------------------
-# Thứ tự quan trọng: cụm dài trước (New York) rồi tới từ ngắn.
-_EN_WORD_MAP = [
-    ('New York', 'Niu Óoc'),
-    ('Los Angeles', 'Lốt An-giơ-lét'),
-    ('San Francisco', 'Xan Phran-xi-cô'),
-    ('Washington', 'Oa-sinh-tơn'),
-    ('Paris', 'Pa-ri'),
-    ('London', 'Luân Đôn'),
-    ('Tokyo', 'Tô-ki-ô'),
-    ('Seoul', 'Xê-un'),
+# LƯU Ý: KHÔNG phiên âm bồi các từ mượn tiếng Anh thông dụng (video, camera,
+# online, robot, internet, website, email, data, radio, logic, computer,
+# software, hardware, smartphone…). Những từ này được giữ nguyên chữ tiếng Anh
+# gốc để engine G2P song ngữ của VieNeu-TTS v3 Turbo tự phát âm chuẩn quốc tế.
+# Chỉ giữ lại các địa danh/tên riêng có âm Hán-Việt đã được Việt hoá tự nhiên.
+_HAN_VIET_PLACE_MAP = [
     ('Beijing', 'Bắc Kinh'),
-    ('Moscow', 'Mát-xcơ-va'),
-    ('Berlin', 'Béc-lin'),
-    ('Internet', 'in-tơ-nét'),
-    ('internet', 'in-tơ-nét'),
-    ('email', 'i-mêu'),
-    ('website', 'quép-sai'),
-    ('online', 'ôn-lai'),
-    ('robot', 'rô-bốt'),
-    ('data', 'đa-ta'),
-    ('camera', 'ca-mê-ra'),
-    ('video', 'vi-đê-ô'),
-    ('radio', 'ra-đi-ô'),
-    ('logic', 'lô-gíc'),
-    ('computer', 'com-pu-tơ'),
-    ('software', 'phần mềm'),
-    ('hardware', 'phần cứng'),
-    ('smartphone', 'điện thoại thông minh'),
-    ('TV', 'ti-vi'),
-    ('GDP', 'gi-đe-pe'),
-    ('CEO', 'giám đốc điều hành'),
-    ('USB', 'u ét bê'),
-    ('Wifi', 'oai-fai'),
-    ('wifi', 'oai-fai'),
+    ('New York', 'Niu Óoc'),
+    ('London', 'Luân Đôn'),
 ]
-_EN_WORD_RE = [
+_HAN_VIET_PLACE_RE = [
     (re.compile(rf'(?<![\w-]){re.escape(src)}(?![\w-])', re.IGNORECASE), dst)
-    for src, dst in _EN_WORD_MAP
+    for src, dst in _HAN_VIET_PLACE_MAP
 ]
 
 # ---------------------------------------------------------------------------
@@ -604,6 +633,43 @@ _PARA_CHAPTER_RE = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# Ký hiệu toán học (fallback khi cache/LLM không phủ)
+# ---------------------------------------------------------------------------
+_MATH_SYMBOL_WORDS = [
+    ('^2', ' bình phương'),
+    ('^3', ' lập phương'),
+    ('√', ' căn bậc hai '),
+    ('∫', ' tích phân '),
+    ('∑', ' tổng của '),
+    ('α', 'an-pha'),
+    ('β', 'bê-ta'),
+    ('γ', 'gam-ma'),
+    ('δ', 'đen-ta'),
+    ('π', 'pi'),
+    ('%', ' phần trăm'),
+]
+_SUPERSCRIPT_RE = re.compile(r'\^(\d+)')
+
+_MATH_SPEECH = {
+    '0': 'không', '1': 'một', '2': 'hai', '3': 'ba', '4': 'bốn', '5': 'năm',
+    '6': 'sáu', '7': 'bảy', '8': 'tám', '9': 'chín',
+}
+
+
+def _normalize_math(text: str) -> str:
+    """Đọc các ký hiệu toán còn sót: ``x^5`` → "x mũ năm", ``√9`` → "căn bậc hai 9"."""
+    if not re.search(r'[\^√∫∑αβγδπ%]', text):
+        return text
+    for src, dst in _MATH_SYMBOL_WORDS:
+        text = text.replace(src, dst)
+    text = _SUPERSCRIPT_RE.sub(
+        lambda m: ' mũ ' + ' '.join(_MATH_SPEECH.get(d, d) for d in m.group(1)),
+        text,
+    )
+    return text
+
+
+# ---------------------------------------------------------------------------
 # Hàm chuẩn hoá chính
 # ---------------------------------------------------------------------------
 def normalize_vi_text(text: str) -> str:
@@ -633,19 +699,30 @@ def normalize_vi_text(text: str) -> str:
     # 3b. Giờ giấc, dải số, mã số có số 0 đứng đầu
     text = _normalize_time(text)
     text = _normalize_ranges(text)
+    text = _normalize_fraction(text)
     text = _normalize_leading_zeros(text)
 
-    # 4. Viết tắt (trước khi đọc số để "TP.HCM" không bị cắt thành "TP.")
+    # 4. Viết tắt tiếng Việt chính thức (trước khi đọc số để "TP.HCM" không bị
+    #    cắt thành "TP.").
     for pattern, repl in _ABBR_MAP:
         text = pattern.sub(repl, text)
     for pattern, repl in _ABBR_TAIL:
         text = pattern.sub(repl, text)
-    for pattern, repl in _LOANWORD_MAP:
+    for pattern, repl in _ORG_ABBR_MAP:
         text = pattern.sub(repl, text)
 
-    # 5. Từ tiếng Anh / địa danh / tên riêng phổ biến -> phiên âm Việt hoá
-    for pattern, repl in _EN_WORD_RE:
+    # 5. Địa danh / tên riêng có âm Hán-Việt chuẩn (Bắc Kinh, Luân Đôn…).
+    #    Từ mượn tiếng Anh thông dụng được giữ nguyên cho engine song ngữ.
+    for pattern, repl in _HAN_VIET_PLACE_RE:
         text = pattern.sub(repl, text)
+
+    # 5b. Self-Enriching Hybrid Normalizer: tra cache động, phát hiện công
+    #     thức toán/hoá & biểu thức lạ, gọi LLM fallback + auto-enrich. Toàn bộ
+    #     tầng này graceful-degrade: thiếu key/offline cũng không crash.
+    text = enrich_and_normalize(text)
+
+    # 5c. Ký hiệu toán học còn lại (cache không phủ): số mũ, dấu ^, căn, tích phân.
+    text = _normalize_math(text)
 
     # 6. Giờ giấc, khoảng số, mã số (trước đo lường & số đứng riêng)
     text = _normalize_clock(text)

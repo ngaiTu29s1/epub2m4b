@@ -92,6 +92,10 @@ FALLBACK_PRESET_VOICES: tuple[str, ...] = (
 
 DEFAULT_PRESET_VOICE = 'Hải Đăng'
 
+# Số chunk gộp mỗi forward của VieNeu-TTS v3 Turbo trên CUDA (CUDA Graph
+# batching). 4 chunk vừa 8GB VRAM nhưng vẫn đạt ~2–3× tốc độ so với batch 1.
+DEFAULT_BATCH_SIZE_CUDA = 4
+
 DEFAULT_CLASSIC_NGAN_REF_WAV = (
     Path(__file__).resolve().parent.parent
     / 'voices'
@@ -261,6 +265,9 @@ class VieNeuEngine(TTSEngine):
         apply_watermark: keep VieNeu's audio watermark. Disabled for QA runs so
             Whisper verification measures the voice, not the watermark.
         device: ``'cuda'`` / ``'cpu'``; auto-detected when omitted.
+        batch_size: số chunk gộp vào một forward của VieNeu-TTS v3 Turbo khi
+            chạy trên CUDA (CUDA Graph batching). ``None`` → mặc định 4 trên
+            ``cuda`` (2–3× nhanh hơn), ``1`` trên CPU.
     """
 
     def __init__(
@@ -271,6 +278,7 @@ class VieNeuEngine(TTSEngine):
         ref_text: str | None = None,
         apply_watermark: bool = False,
         device: str | None = None,
+        batch_size: int | None = None,
     ):
         if mode not in ('preset', 'classic', 'clone'):
             raise ValueError(f"mode không hợp lệ: {mode!r} (chỉ nhận 'preset', 'classic', 'clone')")
@@ -280,6 +288,10 @@ class VieNeuEngine(TTSEngine):
         self.ref_text = ref_text
         self.apply_watermark = apply_watermark
         self.device = device
+        if batch_size is None:
+            resolved_device = device or _available_device()
+            batch_size = DEFAULT_BATCH_SIZE_CUDA if resolved_device == 'cuda' else 1
+        self.batch_size = max(1, int(batch_size))
 
     # -- helpers ----------------------------------------------------------
     def _reference_for_classic(self) -> tuple[Path, str | None]:
@@ -334,6 +346,7 @@ class VieNeuEngine(TTSEngine):
                 wav = tts.infer(
                     text, voice=tts.get_preset_voice(),
                     apply_watermark=self.apply_watermark,
+                    batch_size=self.batch_size,
                 )
                 sample_rate = int(getattr(tts, 'sample_rate', 48000))
                 return _write_wav_resampled(wav, sample_rate, out_wav)
@@ -344,7 +357,10 @@ class VieNeuEngine(TTSEngine):
                 )
 
         tts = load_vieneu_model(self.device)
-        infer_kwargs: dict = {'apply_watermark': self.apply_watermark}
+        infer_kwargs: dict = {
+            'apply_watermark': self.apply_watermark,
+            'batch_size': self.batch_size,
+        }
 
         if self.mode == 'preset':
             infer_kwargs['voice'] = self.voice
@@ -424,6 +440,7 @@ def synthesize_text_to_wav(
 
 
 __all__ = [
+    'DEFAULT_BATCH_SIZE_CUDA',
     'DEFAULT_CLASSIC_NGAN_REF_WAV',
     'DEFAULT_PRESET_VOICE',
     'PRESET_ALIASES',
