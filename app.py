@@ -18,7 +18,6 @@ from core.tts_engine import (
 from core.vieneu_engine import (
     DEFAULT_PRESET_VOICE,
     build_voice_catalogue,
-    list_available_preset_voices,
 )
 from core.voice_harvester import harvest_voice_from_youtube, list_harvested_voices
 
@@ -179,15 +178,15 @@ def _refresh_all_voices():
 def _vieneu_voice_choices() -> list[str]:
     """Dropdown labels for every VieNeu voice: presets + classic + clones.
 
-    Uses the static fallback list so building the UI never triggers a model
-    download; ``refresh_voices_btn`` repopulates the full catalogue on demand.
+    Xây từ catalogue động. Máy chưa có model thì chỉ còn Nguyễn Ngọc Ngạn và các
+    entry clone (không còn danh sách giọng hardcode); ``refresh_voices_btn`` nạp
+    lại khi model sẵn sàng.
     """
-    from core.vieneu_engine import FALLBACK_PRESET_VOICES
-
-    labels = [f'Giọng sẵn có · {name}' for name in FALLBACK_PRESET_VOICES]
-    labels.append('Nguyễn Ngọc Ngạn (kinh điển)')
-    labels.append('Clone · Vui Vẻ')
-    labels.append('Clone · WAV của bạn')
+    try:
+        labels = [o.label for o in build_voice_catalogue()]
+    except Exception as exc:  # pragma: no cover - offline
+        logger.warning(f'⚠️ Không dựng được catalogue giọng: {exc}')
+        labels = ['Nguyễn Ngọc Ngạn (kinh điển)', 'Clone · Vui Vẻ', 'Clone · WAV của bạn']
     return labels
 
 

@@ -61,10 +61,11 @@ NGAN_FINE_TUNE_REPO = 'nguyen-brat/nguyen-ngoc-ngan-vieneu-tts-fine-tune'
 BASE_V3_TURBO_REPO = 'pnnbao-ump/VieNeu-TTS-v3-Turbo'
 
 # ---------------------------------------------------------------------------
-# Voice catalogue
+# Voice catalogue (100% động — không hardcode danh sách giọng)
 # ---------------------------------------------------------------------------
-# Friendly aliases the project spec asks for ("Tuyên", "Bình", "Sơn"…) mapped
-# onto the canonical preset names shipped in voices_v3_turbo.json.
+# Alias thân thiện ("Tuyên", "Bình"…) chỉ là *ánh xạ tên*, không phải danh sách
+# giọng: nếu VieNeu đổi bộ giọng thì alias không còn khớp và ``resolve_voice_name``
+# của model sẽ tự báo lỗi rõ ràng thay vì trả về một giọng "ma".
 PRESET_ALIASES: dict[str, str] = {
     'tuyên': 'Phạm Tuyên',
     'tuyen': 'Phạm Tuyên',
@@ -101,21 +102,81 @@ PRESET_ALIASES: dict[str, str] = {
     'thiền tâm đức': 'Thiền Tâm Đức',
 }
 
-# Fallback catalogue when the ``vieneu`` package is not importable (tests, or a
-# machine where the model was never downloaded).
-FALLBACK_PRESET_VOICES: tuple[str, ...] = (
-    'Adam bựa', 'Trúc Ly', 'Thiện Minh', 'Mai Anh', 'Hải Đăng', 'Thùy Dung',
-    'Thiền Tâm Đức', 'Ngọc Huyền', 'Quang Sơn', 'Ngọc Trân', 'Minh Đức',
-    'Phạm Tuyên', 'Thái Sơn', 'Xuân Vĩnh', 'Thanh Bình', 'Ngọc Linh',
-    'Đoan Trang', 'Thục Đoan', 'Minh Triết', 'Mỹ Duyên', 'Quỳnh Anh',
-    'Đức Trí', 'Kim Thanh', 'Adam', 'Quốc Tuấn',
-)
-
 DEFAULT_PRESET_VOICE = 'Hải Đăng'
 
-# Số chunk gộp mỗi forward của VieNeu-TTS v3 Turbo trên CUDA (CUDA Graph
-# batching). 4 chunk vừa 8GB VRAM nhưng vẫn đạt ~2–3× tốc độ so với batch 1.
-DEFAULT_BATCH_SIZE_CUDA = 4
+# ---------------------------------------------------------------------------
+# Adaptive batch size (hardware-aware; không ép cứng số chunk/forward)
+# ---------------------------------------------------------------------------
+BATCH_SIZE_ENV = 'TTS_BATCH_SIZE'
+
+
+def _vram_gb() -> float | None:
+    """Tổng VRAM của GPU #0 tính bằng GB, hoặc ``None`` nếu không có CUDA."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:  # pragma: no cover - máy không torch / driver lỗi
+        return None
+
+
+def _batch_size_for_vram(vram_gb: float | None) -> int:
+    """Bảng chọn batch_size theo VRAM (xem spec 2026-10-31)."""
+    if vram_gb is None:
+        return 1  # CPU
+    if vram_gb < 6.0:
+        return 2
+    if vram_gb < 10.0:
+        return 4
+    if vram_gb < 16.0:
+        return 8  # RTX 3060 12GB / 4070 — điểm ngọt ~RTF 0.023×
+    return 16
+
+
+def auto_detect_batch_size() -> int:
+    """Batch size theo VRAM (hoặc ``TTS_BATCH_SIZE``), mặc định theo bảng spec."""
+    import os
+
+    raw = os.getenv(BATCH_SIZE_ENV)
+    if raw:
+        try:
+            value = int(str(raw).strip())
+            if value >= 1:
+                return value
+        except (TypeError, ValueError):
+            logger.warning(
+                f'⚠️ [VieNeu] {BATCH_SIZE_ENV}={raw!r} không hợp lệ; bỏ qua và tự dò.'
+            )
+    return _batch_size_for_vram(_vram_gb())
+
+
+# ---------------------------------------------------------------------------
+# Voice classification buckets
+# ---------------------------------------------------------------------------
+VOICE_CATEGORY_STARS = 'stars'
+VOICE_CATEGORY_STORY = 'story'
+VOICE_CATEGORY_NEWS = 'news_and_natural'
+
+_STORY_KEYWORDS = ('kể chuyện', 'đọc truyện')
+_NEWS_KEYWORDS = ('tin tức', 'tự nhiên')
+
+
+def _classify_voice_label(label: str) -> str:
+    """Phân loại theo nhãn chính thức của VieNeu.
+
+    Thứ tự: ⭐ thắng trước; sau đó ``kể chuyện``/``đọc truyện`` → ``story``, rồi
+    ``tin tức``/``tự nhiên`` → ``news_and_natural``. Nhãn lạ về ``news_and_natural``
+    (nhóm rộng nhất) để không bao giờ rơi giọng khỏi catalogue.
+    """
+    low = label.lower()
+    if label.lstrip().startswith('⭐'):
+        return VOICE_CATEGORY_STARS
+    if any(k in low for k in _STORY_KEYWORDS):
+        return VOICE_CATEGORY_STORY
+    return VOICE_CATEGORY_NEWS
+
 
 # Tham số sampling mặc định của ``Vieneu.infer``. ``_infer_chunks`` đọc
 # ``sampling["max_new_frames"]`` trực tiếp (qua ``_cap_frames``) nên KHÔNG được
@@ -234,17 +295,53 @@ def _load_fine_tune(backbone_repo: str):
         _LowLevel.__init__ = original_init
 
 
-def list_available_preset_voices(tts=None) -> list[str]:
-    """All preset voice names available in the (optionally provided) model."""
+def _raw_preset_voices(tts=None) -> list[tuple[str, str]]:
+    """``[(label, name), ...]`` chính thức từ VieNeu; [] nếu không nạp được model.
+
+    Không có danh sách fallback hardcode: máy chưa có model thì catalogue preset
+    rỗng (màn hình chọn giọng vẫn còn Nguyễn Ngọc Ngạn + clone), thay vì hiển thị
+    những giọng có thể không tồn tại ở phiên bản model khác.
+    """
     if tts is None:
         try:
             tts = load_vieneu_model()
-        except Exception as exc:  # pragma: no cover - offline fallback
-            logger.warning(f'⚠️ [VieNeu] Không nạp được mô hình ({exc}); dùng danh sách mặc định.')
-            return list(FALLBACK_PRESET_VOICES)
-    voices = tts.list_preset_voices()
-    # ``list_preset_voices`` returns [(label, name), …] on v3.8.3.
-    return [name for _label, name in voices]
+        except Exception as exc:  # pragma: no cover - offline / chưa tải model
+            logger.warning(f'⚠️ [VieNeu] Không nạp được mô hình ({exc}); không có giọng preset.')
+            return []
+    try:
+        voices = tts.list_preset_voices()
+    except Exception as exc:  # pragma: no cover
+        logger.warning(f'⚠️ [VieNeu] list_preset_voices() lỗi ({exc}); không có giọng preset.')
+        return []
+    out: list[tuple[str, str]] = []
+    for item in voices:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            out.append((str(item[0]), str(item[1])))
+        else:  # pragma: no cover - API cũ chỉ trả tên
+            out.append((str(item), str(item)))
+    return out
+
+
+def get_available_preset_voices(tts=None) -> list[tuple[str, str]]:
+    """Danh sách ``(label, name)`` của mọi giọng preset chính thống (động)."""
+    return _raw_preset_voices(tts)
+
+
+def list_available_preset_voices(tts=None) -> list[str]:
+    """Tên các giọng preset (giữ API cũ cho app.py / tests)."""
+    return [name for _label, name in get_available_preset_voices(tts)]
+
+
+def get_categorized_voices(tts=None) -> dict[str, list[tuple[str, str]]]:
+    """Chia giọng theo nhóm UI: ``stars`` / ``story`` / ``news_and_natural``."""
+    buckets: dict[str, list[tuple[str, str]]] = {
+        VOICE_CATEGORY_STARS: [],
+        VOICE_CATEGORY_STORY: [],
+        VOICE_CATEGORY_NEWS: [],
+    }
+    for label, name in get_available_preset_voices(tts):
+        buckets[_classify_voice_label(label)].append((label, name))
+    return buckets
 
 
 @dataclass
@@ -259,10 +356,18 @@ class VoiceOption:
 
 
 def build_voice_catalogue() -> list[VoiceOption]:
-    """Dropdown entries: all presets + Nguyễn Ngọc Ngạn + Vui Vẻ clone."""
+    """Dropdown entries: live presets from VieNeu + Nguyễn Ngọc Ngạn + Vui Vẻ clone."""
     options: list[VoiceOption] = []
-    for name in list_available_preset_voices():
-        options.append(VoiceOption(label=f'Giọng sẵn có · {name}', mode='preset', voice=name))
+    categories = get_categorized_voices()
+    section_titles = {
+        VOICE_CATEGORY_STARS: 'Giọng tuyển chọn ⭐',
+        VOICE_CATEGORY_STORY: 'Giọng kể chuyện',
+        VOICE_CATEGORY_NEWS: 'Giọng tin tức / tự nhiên',
+    }
+    for category, title in section_titles.items():
+        for label, name in categories.get(category, []):
+            clean = label.replace('⭐', '').strip()
+            options.append(VoiceOption(label=f'{title} · {clean}', mode='preset', voice=name))
 
     options.append(
         VoiceOption(
@@ -321,8 +426,7 @@ class VieNeuEngine(TTSEngine):
         self.apply_watermark = apply_watermark
         self.device = device
         if batch_size is None:
-            resolved_device = device or _available_device()
-            batch_size = DEFAULT_BATCH_SIZE_CUDA if resolved_device == 'cuda' else 1
+            batch_size = auto_detect_batch_size()
         self.batch_size = max(1, int(batch_size))
 
     # -- helpers ----------------------------------------------------------
@@ -618,15 +722,22 @@ def synthesize_text_to_wav(
 
 
 __all__ = [
-    'DEFAULT_BATCH_SIZE_CUDA',
+    'BATCH_SIZE_ENV',
     'DEFAULT_CLASSIC_NGAN_REF_WAV',
     'DEFAULT_PRESET_VOICE',
+    'DEFAULT_SAMPLING',
     'PRESET_ALIASES',
     'VUI_VE_GOLDEN_REF',
     'VUI_VE_GOLDEN_TEXT',
+    'VOICE_CATEGORY_NEWS',
+    'VOICE_CATEGORY_STARS',
+    'VOICE_CATEGORY_STORY',
     'VieNeuEngine',
     'VoiceOption',
+    'auto_detect_batch_size',
     'build_voice_catalogue',
+    'get_available_preset_voices',
+    'get_categorized_voices',
     'list_available_preset_voices',
     'load_vieneu_model',
     'synthesize_text_to_wav',

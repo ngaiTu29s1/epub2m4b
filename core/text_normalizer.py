@@ -7,9 +7,10 @@ thuần** để giọng đọc không bao giờ đọc sai (ví dụ ``Chương 
 import re
 import unicodedata
 import warnings
+from dataclasses import dataclass
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from core.models import AudioSegmentSpec
-from core.llm_normalizer import enrich_and_normalize
+from core.llm_normalizer import enrich_and_normalize, lookup
 
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
 # ---------------------------------------------------------------------------
@@ -922,3 +923,251 @@ def markdown_to_segments(markdown: str, max_chars: int = 500) -> list[AudioSegme
             segments.append(AudioSegmentSpec(text=chunk, pause_after_ms=pause, is_chapter_title=False))
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Uncertainty scanner (UI review + chọn lọc gọi AI)
+# ---------------------------------------------------------------------------
+@dataclass
+class UncertainSpan:
+    """Một điểm nhập nhằng: cần người duyệt hoặc gửi AI xử lý có chọn lọc."""
+
+    token: str
+    sentence: str
+    reason: str  # 'math_equation' | 'chem_formula' | 'mixed_alphanumeric' | 'unknown_abbr' | 'fraction'
+    start: int  # offset của token trong ``text`` gốc
+    end: int
+    suggested_reading: str = ''
+
+    def to_dict(self) -> dict:
+        return {
+            'token': self.token,
+            'sentence': self.sentence,
+            'reason': self.reason,
+            'start': self.start,
+            'end': self.end,
+            'suggested_reading': self.suggested_reading,
+        }
+
+
+# Biểu thức có dấu hiệu toán học thực sự (không bắt "=" đơn lẻ trong văn xuôi).
+_EQUATION_RE = re.compile(
+    r'(?<![\w.])(?:[A-Za-zα-ω][A-Za-z0-9α-ω]*[\s\^0-9+\-*.()]*)?'
+    r'=\s*[-+]?[A-Za-z0-9.^]+(?:\s*[-+]\s*[A-Za-z0-9.^]+)*'
+)
+_EXPONENT_TERM_RE = re.compile(
+    r'(?<![\w.^])[A-Za-zα-ω][A-Za-z0-9α-ω]*\^\s*\d+'
+    r'(?:\s*[-+]\s*\d*[A-Za-zα-ω][A-Za-z0-9α-ω]*\^?\s*\d*)*'
+)
+_MATH_SYMBOL_RE = re.compile(r'[√∫∑∏∂±≤≥≠∞]|\b(?:sqrt|int|sum|lim)\b')
+# Token chữ + số kiểu F-35 / Zz7 / COVID-19 / H2SO4.
+_MIXED_RE = re.compile(r'\b[A-Za-zẠ-ỹ]+(?:[-_]?\d+[A-Za-z]*|[A-Za-z]+[-_]?\d+)\b')
+_CHEM_CANDIDATE_RE = re.compile(r'\b(?:[A-Z][a-z]?\d?){2,}\b')
+# Ứng viên công thức rộng hơn (bắt cả Fe2, Cl2) — lọc kỹ ở ``_is_known_chem``.
+_MIXED_CANDIDATE_RE = re.compile(r'\b[A-Z][A-Za-z]?\d+[A-Za-z0-9]*\b|\b(?:[A-Z][a-z]?\d?){2,}\b')
+_FRACTION_RE = re.compile(r'(?<![\d/])(\d{1,4})\s*/\s*(\d{1,4})(?![\d/])(?![/.-]\d)')
+# Viết tắt in hoa toàn bộ: WHO, UNESCO, GDP (không bắt chữ hoa đầu câu).
+_UPPER_ABBR_RE = re.compile(r'(?<![^\W\d_])([A-ZĐ][A-ZĐ0-9]{1,7})(?![^\W\d_])')
+
+# Các viết tắt đã được pipeline đọc sẵn (không phải điểm nghi vấn).
+_KNOWN_ABBREVIATIONS = {
+    'UBND', 'HĐND', 'THPT', 'THCS', 'DNNN', 'NXB', 'GS', 'PGS', 'TS', 'THS',
+    'BS', 'TP', 'HCM', 'HN', 'ĐH', 'UNESCO', 'WHO', 'GDP', 'ADN', 'COVID',
+    'VTV', 'VOV', 'VNA', 'AI', 'GDP', 'CNTT', 'KCN', 'BQL', 'SĐT', 'CMND',
+    'SXKD', 'KHCN', 'KTXH', 'XHCN', 'TBCN', 'ĐCS', 'VND', 'USD', 'EUR',
+}
+
+_SENTENCE_SPLIT_RE = re.compile(r'(?<=[.!?…])\s+')
+
+
+def _sentence_at(text: str, pos: int) -> str:
+    """Câu chứa offset ``pos`` (tách theo dấu câu, giữ nguyên văn)."""
+    starts = [0] + [m.end() for m in _SENTENCE_SPLIT_RE.finditer(text)]
+    start = 0
+    for s in starts:
+        if s <= pos:
+            start = s
+        else:
+            break
+    end_match = _SENTENCE_SPLIT_RE.search(text, start)
+    end = end_match.start() if end_match else len(text)
+    return text[start:end].strip()
+
+
+def _suggest_math(token: str) -> str:
+    try:
+        return _normalize_math(normalize_vi_text(token))
+    except Exception:  # pragma: no cover - phòng thủ
+        return token
+
+
+def _looks_like_acronym(token: str) -> bool:
+    """``UNESCO``/``FAO`` — chuỗi in hoa toàn bộ, không có chữ số.
+
+    ``XY3Z9``/``H2SO4`` có chữ số nên vẫn được coi là dãy hoá học.
+    """
+    return token.isupper() and len(token) >= 2 and not any(ch.isdigit() for ch in token)
+
+
+# Ký hiệu nguyên tố: ký tự in hoa (O, H, K) hoặc hoa+thường (Mn, Fe, Cl).
+# Chỉ để nhận dạng *cấu trúc* công thức — không cần bảng nguyên tố đầy đủ vì
+# token lạ đã bị lọc ở nhánh acronym/mixed trước đó.
+_ELEMENT_SYMBOL_RE = re.compile(r'[A-Z][a-z]?')
+
+
+def _is_simple_chem_token(token: str) -> bool:
+    """``O2``/``H2``/``Cl2``/``NaCl`` — chỉ gồm ký hiệu nguyên tố + hệ số."""
+    if not token or not token[0].isupper():
+        return False
+    i = 0
+    symbols = 0
+    while i < len(token):
+        match = _ELEMENT_SYMBOL_RE.match(token, i)
+        if not match:
+            return False
+        symbols += 1
+        i = match.end()
+        while i < len(token) and token[i].isdigit():
+            i += 1
+    # ≥ 2 ký hiệu (H2O, NaCl) → chắc chắn công thức. Một ký hiệu duy nhất chỉ
+    # nhận khi là đơn chất quen thuộc (O2, H2, N2) — tách khỏi "Zz7"/"Xx2".
+    if symbols >= 2:
+        return True
+    return token in {'O2', 'H2', 'N2', 'F2', 'Cl2', 'Br2', 'I2', 'O3'}
+
+
+def _is_known_chem(token: str) -> bool:
+    # Từ điển cache luôn thắng.
+    if lookup(token):
+        return True
+    # Viết tắt in hoa (FAO, UNESCO) không phải công thức hoá học dù trùng khuôn.
+    if _looks_like_acronym(token):
+        return True
+    # Dãy ký tự hoá học hợp lệ và ngắn (H2O, CO2, O2) do rule-based đọc sẵn.
+    if len(token) <= 4 and _is_simple_chem_token(token):
+        return True
+    return False
+
+
+def detect_uncertain_spans(text: str) -> list[dict]:
+    """Quét nhanh các điểm nhập nhằng cần duyệt/AI.
+
+    Trả danh sách ``dict`` (sắp theo vị trí, không trùng token cùng vị trí):
+    ``{token, sentence, reason, start, end, suggested_reading}``.
+    """
+    if not text or not text.strip():
+        return []
+
+    spans: list[UncertainSpan] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add(token: str, start: int, end: int, reason: str, suggestion: str = '') -> None:
+        if (start, end) in seen:
+            return
+        seen.add((start, end))
+        spans.append(
+            UncertainSpan(
+                token=token,
+                sentence=_sentence_at(text, start),
+                reason=reason,
+                start=start,
+                end=end,
+                suggested_reading=suggestion,
+            )
+        )
+
+    covered: list[tuple[int, int]] = []
+    math_matches = [
+        m for pattern in (_EQUATION_RE, _EXPONENT_TERM_RE, _MATH_SYMBOL_RE)
+        for m in pattern.finditer(text)
+    ]
+    math_matches.sort(key=lambda m: (m.start(), -(m.end() - m.start())))
+    kept: list[re.Match] = []
+    for match in math_matches:
+        if any(a <= match.start() and match.end() <= b for a, b in covered):
+            continue  # đã nằm trong biểu thức dài hơn
+        covered.append((match.start(), match.end()))
+        kept.append(match)
+    # Gộp mảnh liền kề ("x^2 + 2x" + "= 0") thành một biểu thức duy nhất.
+    merged: list[tuple[int, int]] = []
+    for match in kept:
+        bridge = text[merged[-1][1]:match.start()] if merged else None
+        if (
+            merged
+            and '=' in match.group(0)
+            and len(bridge) <= 8
+            and re.fullmatch(r'[\s+\-*/^()\d.]*', bridge)
+        ):
+            merged[-1] = (merged[-1][0], match.end())
+        else:
+            merged.append((match.start(), match.end()))
+    for start, end in merged:
+        token = text[start:end].strip()
+        add(token, start, end, 'math_equation', _suggest_math(token))
+
+    for match in _FRACTION_RE.finditer(text):
+        token = match.group(0)
+        add(token, match.start(), match.end(), 'fraction', _suggest_math(token))
+
+    for match in _MIXED_CANDIDATE_RE.finditer(text):
+        token = match.group(0)
+        if _is_known_chem(token):
+            continue
+        if _is_simple_chem_token(token):
+            add(token, match.start(), match.end(), 'chem_formula', token)
+
+    for match in _MIXED_RE.finditer(text):
+        token = match.group(0)
+        if not any(ch.isdigit() for ch in token):
+            continue
+        if lookup(token) or _is_known_chem(token):
+            continue  # đã có trong cache hoặc là dãy hoá học (O2, CO2, NaCl)
+        add(token, match.start(), match.end(), 'mixed_alphanumeric', token)
+
+    for match in _UPPER_ABBR_RE.finditer(text):
+        token = match.group(1)
+        # Bỏ qua nếu đây là phần đầu của một token dài hơn (đã xử lý ở trên).
+        tail_end = match.end()
+        if tail_end < len(text) and (text[tail_end].isalpha() or text[tail_end].isdigit()):
+            continue
+        sentence_start = _sentence_at(text, match.start())
+        if sentence_start and sentence_start[0] == token[0] and text.startswith(token, match.start()):
+            # Chữ hoa đầu câu một chữ ("Trời") — không phải viết tắt.
+            if token[1:2].islower() or len(token) == 1:
+                continue
+        if token.upper() in _KNOWN_ABBREVIATIONS or lookup(token):
+            continue
+        if any(ch.isdigit() for ch in token):
+            continue  # đã thuộc mixed_alphanumeric
+        if token[1:].islower():
+            continue  # "Chương", "Xin" — chữ hoa đầu câu, không phải viết tắt
+        add(token, match.start(), match.end(), 'unknown_abbr', token)
+
+    # Bỏ span nằm lồng trong span khác cùng offset (thường là ký hiệu toán nằm
+    # trong cả biểu thức đã bắt trọn) — giữ span dài nhất.
+    # Dấu ^ nằm ngoài mọi biểu thức đã bắt (vd. "x^2 + 2x + 1 = 0" chỉ khớp
+    # phần đầu) vẫn là điểm nghi vấn.
+    for match in re.finditer(r'\^', text):
+        pos = match.start()
+        if any(start <= pos < end for start, end in covered):
+            continue
+        add('^', pos, pos + 1, 'math_equation', 'mũ')
+
+    spans.sort(key=lambda s: (s.start, -(s.end - s.start)))
+    deduped: list[UncertainSpan] = []
+    for span in spans:
+        if any(
+            other.start <= span.start and span.end <= other.end and other is not span
+            for other in deduped
+        ):
+            continue
+        deduped.append(span)
+    return [s.to_dict() for s in deduped]
+
+
+def uncertain_spans_to_review(text: str) -> list[dict]:
+    """Bản sao tiện cho UI: chỉ giữ token + câu + lý do (bỏ offset)."""
+    return [
+        {'token': s['token'], 'sentence': s['sentence'], 'reason': s['reason']}
+        for s in detect_uncertain_spans(text)
+    ]

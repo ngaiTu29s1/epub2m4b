@@ -32,14 +32,6 @@ def test_resolve_alias_maps_friendly_names():
     assert _resolve_alias('không-tồn-tại') == 'không-tồn-tại'
 
 
-def test_preset_aliases_target_real_catalogue_names():
-    """Every alias must resolve to one of the 25 shipped preset voices."""
-    from core.vieneu_engine import FALLBACK_PRESET_VOICES
-
-    for target in PRESET_ALIASES.values():
-        assert target in FALLBACK_PRESET_VOICES, f'{target!r} không nằm trong catalogue'
-
-
 def test_engine_rejects_unknown_mode():
     with pytest.raises(ValueError):
         VieNeuEngine(mode='not-a-mode')
@@ -130,37 +122,33 @@ def test_catalogue_contains_classic_and_clone_entries(monkeypatch):
     assert any('Clone · Vui Vẻ' in label for label in labels)
 
 
-def test_build_voice_catalogue_uses_fallback_when_model_unavailable(monkeypatch):
+def test_build_voice_catalogue_without_model_has_no_hardcoded_presets(monkeypatch):
+    """Không còn danh sách giọng hardcode: offline → chỉ classic + clone."""
     def boom(*_a, **_kw):
         raise RuntimeError('no model')
 
     monkeypatch.setattr(vieneu_engine, 'load_vieneu_model', boom)
-    labels = [o.label for o in build_voice_catalogue()]
-    # Preset entries fall back to the static catalogue.
-    assert any('Giọng sẵn có ·' in label for label in labels)
+    options = build_voice_catalogue()
+    assert all(o.mode != 'preset' for o in options)
+    labels = [o.label for o in options]
+    assert any('Nguyễn Ngọc Ngạn' in label for label in labels)
+    assert any('Clone · Vui Vẻ' in label for label in labels)
+    assert not hasattr(vieneu_engine, 'FALLBACK_PRESET_VOICES')
 
 
-def test_list_available_preset_voices_falls_back_offline(monkeypatch):
+def test_list_available_preset_voices_empty_offline(monkeypatch):
     def boom(*_a, **_kw):
         raise RuntimeError('offline')
 
     monkeypatch.setattr(vieneu_engine, 'load_vieneu_model', boom)
-    voices = vieneu_engine.list_available_preset_voices()
-    assert len(voices) == len(vieneu_engine.FALLBACK_PRESET_VOICES)
+    assert vieneu_engine.list_available_preset_voices() == []
 
 
-def test_batch_size_default_on_cuda(monkeypatch):
-    """Trên CUDA, batch_size mặc định = DEFAULT_BATCH_SIZE_CUDA."""
-    monkeypatch.setattr(vieneu_engine, '_available_device', lambda: 'cuda')
+def test_batch_size_default_is_adaptive(monkeypatch):
+    """Mặc định lấy từ ``auto_detect_batch_size`` (VRAM/env), không hardcode."""
+    monkeypatch.setattr(vieneu_engine, 'auto_detect_batch_size', lambda: 8)
     engine = VieNeuEngine(device='cuda')
-    assert engine.batch_size == vieneu_engine.DEFAULT_BATCH_SIZE_CUDA
-
-
-def test_batch_size_default_on_cpu(monkeypatch):
-    """Trên CPU, batch_size mặc định = 1 (chạy tuần tự)."""
-    monkeypatch.setattr(vieneu_engine, '_available_device', lambda: 'cpu')
-    engine = VieNeuEngine(device='cpu')
-    assert engine.batch_size == 1
+    assert engine.batch_size == 8
 
 
 def test_batch_size_explicit_overrides_default():
