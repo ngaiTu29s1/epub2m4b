@@ -1,10 +1,12 @@
-"""Render the ``# PHẦN DẪN`` chapter with both Chatterbox/Viterbox engines.
+"""Render the ``# PHẦN DẪN`` chapter with the optimized Viterbox engine.
 
-Produces two Vietnamese audiobooks of the same chapter for A/B comparison,
-each as a 24 kHz mono WAV plus a packaged single-chapter ``.m4b``:
+Produces a Vietnamese audiobook clip as a 24 kHz mono WAV plus a packaged
+single-chapter ``.m4b``:
 
-* Viterbox TTS  -> ``output_viterbox_tts.wav``  & ``.m4b``
-* Edge + CB VC  -> ``output_chatterbox_vc.wav`` & ``.m4b``
+* Viterbox TTS (Vui Vẻ clone) -> ``output_viterbox_tts.wav`` & ``.m4b``
+
+The ``--with-vc`` flag additionally renders the Edge-TTS + ChatterboxVC mode
+for A/B comparison (``output_chatterbox_vc.wav`` & ``.m4b``).
 
 Run with the repo venv::
 
@@ -13,6 +15,7 @@ Run with the repo venv::
 from __future__ import annotations
 
 import logging
+import sys
 import wave
 from pathlib import Path
 
@@ -66,13 +69,14 @@ def main() -> None:
 
     from core.chatterbox_engine import ChatterboxVCEngine, ViterboxTTSEngine
 
-    # Mode 1: Viterbox zero-shot TTS cloning the Vui Vẻ golden reference.
+    # Primary mode: Viterbox zero-shot TTS cloning the Vui Vẻ golden reference.
     viterbox = ViterboxTTSEngine(audio_prompt=GOLDEN_REF)
     _render('Viterbox TTS', viterbox, chapter, OUT_DIR / 'output_viterbox_tts.wav')
 
-    # Mode 2: Edge-TTS pronunciation + S3Gen voice conversion to Vui Vẻ timbre.
-    vc = ChatterboxVCEngine(audio_prompt=GOLDEN_REF)
-    _render('Edge+ChatterboxVC', vc, chapter, OUT_DIR / 'output_chatterbox_vc.wav')
+    if '--with-vc' in sys.argv:
+        # Optional A/B mode: Edge-TTS pronunciation + S3Gen voice conversion.
+        vc = ChatterboxVCEngine(audio_prompt=GOLDEN_REF)
+        _render('Edge+ChatterboxVC', vc, chapter, OUT_DIR / 'output_chatterbox_vc.wav')
 
 
 if __name__ == '__main__':

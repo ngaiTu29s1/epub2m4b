@@ -417,3 +417,38 @@ def render_chapter(
         duration_ms=current_ms,
         cues=cues,
     )
+
+
+# --------------------------------------------------------------------------
+# Lazy re-exports of the Chatterbox/Viterbox engines.
+# --------------------------------------------------------------------------
+# ``core.chatterbox_engine`` imports this module (for ``TTSEngine`` and the WAV
+# helpers), so importing it at module top-level would create a cycle. Exposing
+# the engines through ``__getattr__`` lets callers write
+# ``from core.tts_engine import ViterboxTTSEngine`` while keeping the heavy
+# torch/viterbox imports lazy until the engine is actually used.
+_LAZY_ENGINE_EXPORTS = {
+    'ViterboxTTSEngine': 'core.chatterbox_engine',
+    'ChatterboxVCEngine': 'core.chatterbox_engine',
+}
+
+__all__ = [
+    'ChapterAudioResult',
+    'ChatterboxVCEngine',
+    'EdgeTTSEngine',
+    'F5TTSEngine',
+    'SAMPLE_RATE',
+    'SubtitleCue',
+    'TTSEngine',
+    'ViterboxTTSEngine',
+    'render_chapter',
+]
+
+
+def __getattr__(name: str):
+    module_path = _LAZY_ENGINE_EXPORTS.get(name)
+    if module_path is None:
+        raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+    import importlib
+
+    return getattr(importlib.import_module(module_path), name)

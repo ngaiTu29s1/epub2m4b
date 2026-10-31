@@ -13,6 +13,7 @@ from core.tts_engine import (
     EdgeTTSEngine,
     F5TTSEngine,
     TTSEngine,
+    ViterboxTTSEngine,
     render_chapter,
 )
 from core.voice_harvester import harvest_voice_from_youtube, list_harvested_voices
@@ -253,6 +254,11 @@ def _create_tts_engine(
     f5_ref_text: str = '',
 ) -> TTSEngine:
     rate_str = f'{int(rate_pct):+d}%'
+    if 'Viterbox' in engine_choice:
+        # Viterbox reads Vietnamese directly and clones the Vui Vẻ timbre from
+        # the golden reference; the tuned defaults in ViterboxTTSEngine give a
+        # calm, clearly-articulated pace.
+        return ViterboxTTSEngine()
     if 'F5-TTS' in engine_choice:
         if not f5_ref_audio:
             raise ValueError('Vui lòng tải lên file audio mẫu (10-15s) cho F5-TTS.')
@@ -438,11 +444,12 @@ def build_app() -> gr.Blocks:
                         engine_choice = gr.Radio(
                             label='Chế độ Engine',
                             choices=[
+                                'Viterbox Zero-shot TTS (Giọng Vui Vẻ)',
                                 'Edge-TTS (Siêu nhanh)',
                                 'F5-TTS Clone (Nhân bản giọng RTX 3060)',
                                 'Edge-TTS + RVC (Đổi màu giọng RTX 3060)',
                             ],
-                            value='F5-TTS Clone (Nhân bản giọng RTX 3060)' if 'vui_ve' in _harvested_voice_ids() else 'Edge-TTS (Siêu nhanh)',
+                            value='Viterbox Zero-shot TTS (Giọng Vui Vẻ)' if 'vui_ve' in _harvested_voice_ids() else 'Edge-TTS (Siêu nhanh)',
                         )
 
                     with gr.Row(visible=not ('vui_ve' in _harvested_voice_ids())) as edge_controls:

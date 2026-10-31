@@ -122,12 +122,18 @@ def normalize_text(text: str, language: str = "vi") -> str:
     return text
 
 
-def _split_text_to_sentences(text: str) -> List[str]:
-    """Split text into sentences by punctuation marks."""
+def _split_text_to_sentences(text: str, max_words: int = 20) -> List[str]:
+    """Split text into sentences by punctuation marks.
+
+    Long multi-clause sentences (>= 18 words containing a comma) are further
+    split on ``,`` / ``;`` / ``–—`` so T3 does not accelerate and slur the tail
+    of a 50-65 word sentence. Every emitted chunk is terminated with a full
+    stop so T3 lands a natural falling intonation.
+    """
     # Split by . ? ! and keep the delimiter
     pattern = r'([.?!]+)'
     parts = re.split(pattern, text)
-    
+
     sentences = []
     current = ""
     for i, part in enumerate(parts):
@@ -139,12 +145,38 @@ def _split_text_to_sentences(text: str) -> List[str]:
             current = ""
         else:
             current = part
-    
+
     # Don't forget remaining text without ending punctuation
     if current.strip():
         sentences.append(current.strip())
-    
-    return [s for s in sentences if s.strip()]
+
+    sentences = [s for s in sentences if s.strip()]
+
+    # Second pass: break long comma-clause sentences into short clauses.
+    chunked: List[str] = []
+    for sentence in sentences:
+        if len(sentence.split()) < 18 or ',' not in sentence:
+            chunked.append(sentence)
+            continue
+        pieces = re.split(r'(?<=[,;–—])\s+', sentence)
+        current_clause = ""
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            if current_clause and len(current_clause.split()) + len(piece.split()) > max_words:
+                chunked.append(current_clause)
+                current_clause = piece
+            else:
+                current_clause = f'{current_clause} {piece}'.strip()
+        if current_clause:
+            chunked.append(current_clause)
+
+    return [
+        c if c.endswith(('.', '!', '?', '…')) else f'{c}.'
+        for c in (chunked or sentences)
+        if c.strip()
+    ]
 
 
 def trim_silence(audio: np.ndarray, sr: int, top_db: int = 30) -> np.ndarray:
@@ -517,13 +549,24 @@ class Viterbox:
         
         return model
     
-    def prepare_conditionals(self, audio_prompt: Union[str, Path, torch.Tensor], exaggeration: float = 0.5):
+    def prepare_conditionals(
+        self,
+        audio_prompt: Union[str, Path, torch.Tensor],
+        exaggeration: float = 0.5,
+        prompt_time_stretch: float = 1.0,
+    ):
         """
         Prepare conditioning from reference audio.
         
         Args:
             audio_prompt: Path to WAV file or audio tensor
             exaggeration: Expression intensity (0.0 - 2.0)
+            prompt_time_stretch: Rate applied to the 16 kHz prompt copy that
+                feeds the T3 speech-conditioning tokens. Values < 1 slow the
+                prompt's rhythm, so T3 clones the *timbre* of the reference
+                while reading at a calmer, clearly-articulated pace. The
+                S3Gen/voice-encoder waveforms are left untouched to preserve
+                the speaker timbre exactly.
         """
         # Load audio at S3Gen sample rate (24kHz)
         if isinstance(audio_prompt, (str, Path)):
@@ -541,6 +584,13 @@ class Viterbox:
         ENC_COND_LEN = S3_SR * 10
         s3gen_ref_wav = s3gen_ref_wav[:DEC_COND_LEN]
         
+        # The T3 speech-conditioning prompt (which carries the reading *pace*)
+        # gets the tempo change; the S3Gen/voice-encoder copies do not, so the
+        # cloned timbre stays bit-for-bit identical to the golden reference.
+        prompt_16k = ref_16k_wav
+        if prompt_time_stretch and abs(prompt_time_stretch - 1.0) > 1e-3:
+            prompt_16k = librosa.effects.time_stretch(ref_16k_wav, rate=float(prompt_time_stretch))
+        
         with torch.inference_mode():
             # Get S3Gen conditioning
             s3_cond = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
@@ -549,10 +599,10 @@ class Viterbox:
             t3_cond_prompt_tokens = None
             if plen := self.t3.hp.speech_cond_prompt_len:
                 s3_tokzr = self.s3gen.tokenizer
-                t3_cond_prompt_tokens, _ = s3_tokzr.forward([ref_16k_wav[:ENC_COND_LEN]], max_len=plen)
+                t3_cond_prompt_tokens, _ = s3_tokzr.forward([prompt_16k[:ENC_COND_LEN]], max_len=plen)
                 t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(self.device)
             
-            # Voice-encoder speaker embedding
+            # Voice-encoder speaker embedding (original 16k prompt: timbre).
             ve_embed = torch.from_numpy(self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR))
             ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
             
@@ -639,6 +689,8 @@ class Viterbox:
         split_sentences: bool = True,
         crossfade_ms: int = 50,
         sentence_pause_ms: int = 500,
+        prompt_time_stretch: float = 1.0,
+        cond_margin_s: float = 0.12,
     ) -> torch.Tensor:
         """
         Generate speech from text.
@@ -655,13 +707,18 @@ class Viterbox:
             split_sentences: Whether to split text by punctuation and generate separately
             crossfade_ms: Crossfade duration in milliseconds when merging sentences
             sentence_pause_ms: Pause duration between sentences in milliseconds (default 500ms)
+            prompt_time_stretch: Tempo applied to the T3 speech-conditioning prompt
+                (timbre-preserving pacing control; see ``prepare_conditionals``).
+            cond_margin_s: VAD trim margin kept after the last speech frame;
+                a generous margin (>= 0.12 s) prevents short titles like
+                "Phần dẫn." from losing their falling tail.
             
         Returns:
             Audio tensor (1, samples) at 24kHz
         """
         # Prepare conditioning - use random voice if no audio_prompt and no conds
         if audio_prompt is not None:
-            self.prepare_conditionals(audio_prompt, exaggeration)
+            self.prepare_conditionals(audio_prompt, exaggeration, prompt_time_stretch)
         elif self.conds is None:
             # Try to use a random voice from wavs folder
             random_voice = get_random_voice()
@@ -698,8 +755,9 @@ class Viterbox:
                 )
                 
                 # Trim silence using VAD (more precise endpointing)
-                # Keep margin reasonable (50ms) as we prevent clicks at generation level now
-                audio_np = vad_trim(audio_np, self.sr, margin_s=0.05)
+                # Keep a generous margin so short titles ("Phần dẫn.") do not
+                # lose their falling tail to an aggressive VAD endpoint.
+                audio_np = vad_trim(audio_np, self.sr, margin_s=cond_margin_s)
                 
                 # Apply fade-out to prevent click at end of each segment
                 audio_np = apply_fade_out(audio_np, self.sr, fade_duration=0.01)  # 10ms fade-out

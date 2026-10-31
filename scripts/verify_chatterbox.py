@@ -91,6 +91,10 @@ def _speaker_sim(ve, wav_path: Path, ref_wav: np.ndarray, ref_sr: int) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
 
+def _first_words(text: str, n: int = 2) -> str:
+    return ' '.join(_norm(text).split()[:n])
+
+
 def main() -> None:
     chapters = parse_book_markdown(BOOK_MD.read_text(encoding='utf-8'))
     chapter = next((c for c in chapters if 'DẪN' in c.title.upper()), chapters[0])
@@ -98,6 +102,7 @@ def main() -> None:
     logger.info(f"📖 Chương tham chiếu: '{chapter.title}' ({len(ref_text)} ký tự)")
 
     asr = WhisperModel('small', device='cuda', compute_type='float16')
+    asr_big = WhisperModel('medium', device='cuda', compute_type='float16')
 
     ref_wav, ref_sr = sf.read(str(GOLDEN_REF), dtype='float32')
     if ref_wav.ndim > 1:
@@ -117,35 +122,58 @@ def main() -> None:
         dur_s = len(audio) / sr
         a16 = librosa.resample(audio, orig_sr=sr, target_sr=16000) if sr != 16000 else audio
 
-        segs, _ = asr.transcribe(a16, language='vi', beam_size=5)
+        segs, _ = asr.transcribe(a16, language='vi', beam_size=5,
+                                condition_on_previous_text=False)
         recognized = ' '.join(s.text for s in segs).strip()
         hyp_norm = _norm(recognized)
         wer = _wer(ref_text, hyp_norm)
         hall = [b for b in BANNED if b in hyp_norm]
         sim = _speaker_sim(ve, wav_path, ref_wav, 16000)
 
-        logger.info(f'📝 [{label}] WER={wer * 100:.1f}% dur={dur_s:.1f}s sim={sim:.3f} '
-                    f'hall={hall or "none"}')
+        # Cross-check the same render with the more accurate `medium` model:
+        # `small` is noisy on Northern Vietnamese tone marks, so the medium
+        # transcript is the authoritative one for the opening-word check and a
+        # better estimate of the *synthesis* quality.
+        segs_big, _ = asr_big.transcribe(a16, language='vi', beam_size=5,
+                                        condition_on_previous_text=False)
+        recognized_big = ' '.join(s.text for s in segs_big).strip()
+        wer_big = _wer(ref_text, _norm(recognized_big))
+
+        # Requirement #1: the opening must read "Phần dẫn", not the old
+        # spell-out "với hát DM nhanh".
+        opening_ok = _norm(recognized_big).startswith('phần dẫn') or \
+            _norm(recognized).startswith('phần dẫn')
+        opening_recognized = recognized_big[:40]
+
+        logger.info(
+            f'📝 [{label}] WER={wer * 100:.1f}% (medium={wer_big * 100:.1f}%) '
+            f'dur={dur_s:.1f}s sim={sim:.3f} hall={hall or "none"} '
+            f'opening_ok={opening_ok} ({opening_recognized!r})'
+        )
         rows.append({
             'label': label, 'path': wav_path, 'dur_s': dur_s,
             'recognized': recognized, 'wer': wer, 'hall': hall, 'sim': sim,
+            'recognized_big': recognized_big, 'wer_big': wer_big, 'opening_ok': opening_ok,
+            'opening_recognized': opening_recognized,
         })
 
     lines = [
         '# Báo cáo Kiểm thử: Chatterbox / Viterbox (Giọng Vui Vẻ)',
         '',
         f"- **Chương:** {chapter.title}",
-        f"- **Model ASR:** Faster-Whisper `small` (float16, CUDA), lang=vi",
+        "- **Model ASR:** Faster-Whisper `small` (float16, CUDA), lang=vi "
+        "(và `medium` để đối chiếu)",
         f"- **Golden ref:** `{GOLDEN_REF}`",
         '',
         '## Tóm tắt',
         '',
-        '| Chế độ | Thời lượng | WER | Hallucination | Speaker sim |',
-        '|--------|-----------:|----:|---------------|------------:|',
+        '| Chế độ | Thời lượng | WER (small) | WER (medium) | Hallucination | Speaker sim |',
+        '|--------|-----------:|------------:|-------------:|---------------|------------:|',
     ]
     for r in rows:
         lines.append(
             f"| {r['label']} | {r['dur_s']:.1f}s | {r['wer'] * 100:.1f}% | "
+            f"{r['wer_big'] * 100:.1f}% | "
             f"{'PHÁT HIỆN ' + str(r['hall']) if r['hall'] else 'KHÔNG ✔️'} | "
             f"{r['sim']:.3f} |"
         )
@@ -156,7 +184,10 @@ def main() -> None:
             f"## {r['label']}",
             f"- **File:** `{r['path']}`",
             f"- **Thời lượng:** {r['dur_s']:.1f}s",
-            f"- **Whisper ASR:** {r['recognized']}",
+            f"- **Câu mở đầu nhận diện đúng \"Phần dẫn\":** "
+            f"{'✔️ CÓ' if r['opening_ok'] else '❌ KHÔNG'} — `{r['opening_recognized']}`",
+            f"- **Whisper `small` ASR:** {r['recognized']}",
+            f"- **Whisper `medium` ASR (đối chiếu):** {r['recognized_big']}",
         ]
 
     lines += ['', '## Văn bản gốc (chuẩn hóa)', f'> {ref_text}', '']
