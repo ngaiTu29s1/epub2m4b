@@ -108,15 +108,15 @@ def test_gradio_app_builds_and_handles_pipeline(tmp_path: Path, monkeypatch):
     config = demo.get_config_file()
     api_names = {d.get('api_name') for d in config.get('dependencies', [])}
     assert 'handle_harvest_voice' in api_names
-    assert 'handle_select_harvested_voice' in api_names
     assert '_load_harvested_voices' in api_names
+    assert '_refresh_all_voices' in api_names
 
     labels = [
         ' '.join(str(component.get('props', {}).get(key, '')) for key in ('label', 'value'))
         for component in config.get('components', [])
     ]
     assert any('Auto Voice Harvester' in label for label in labels)
-    assert any('Profile giọng đã cào' in label for label in labels)
+    assert any('Chọn giọng đọc' in label for label in labels)
 
     epub_path = _create_test_epub(tmp_path / 'demo.epub')
     state, title, author, cover, checkbox_update, md_text = app.handle_epub_upload(
@@ -137,10 +137,8 @@ def test_gradio_app_builds_and_handles_pipeline(tmp_path: Path, monkeypatch):
         engine_choice='Edge-TTS (Siêu nhanh)',
         voice_choice='vi-VN-NamMinhNeural',
         rate_pct=0,
-        rvc_pth='',
-        rvc_index='',
-        f5_ref_audio=None,
-        f5_ref_text='',
+        clone_ref_audio=None,
+        clone_ref_text='',
         force_rerender=True,
     )
     assert Path(m4b_out).exists()
@@ -181,7 +179,7 @@ def test_app_harvest_voice_and_apply_golden_ref(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr(app, 'harvest_voice_from_youtube', fake_harvest)
 
-    summary, golden_wav, golden_text, rows = app.handle_harvest_voice(
+    summary, rows = app.handle_harvest_voice(
         voice_id='vui_ve',
         query_or_url='https://www.youtube.com/watch?v=3kqJ6u2LrNU',
         target_minutes=6.0,
@@ -189,22 +187,17 @@ def test_app_harvest_voice_and_apply_golden_ref(tmp_path: Path, monkeypatch):
     )
 
     assert 'vui_ve' in summary
-    assert '27' in summary
-    assert Path(golden_wav).exists()
-    assert Path(golden_wav).name == 'golden_01.wav'
-    assert golden_text == 'Đàn ông và phụ nữ ở bẩn thì sẽ có đôi chút khác biệt'
     assert len(rows) == 1
     row = rows[0]
     assert row[0] == 'vui_ve'
     assert '27' in str(row[1])
     assert '6.2' in str(row[2])
-    assert row[3] == golden_wav
+    assert 'golden_01.wav' in str(row[3])
 
-    # handle_select_harvested_voice auto-populates the F5-TTS reference fields
-    choices, summary2, sel_wav, sel_text = app.handle_select_harvested_voice('vui_ve')
-    assert 'vui_ve' in choices['choices']
-    assert 'vui_ve' in summary2
-    assert Path(sel_wav).exists()
-    assert sel_text == 'Đàn ông và phụ nữ ở bẩn thì sẽ có đôi chút khác biệt'
+    # The harvested profile must be visible to the clone-voice resolver.
+    ref_audio, ref_text = app._clone_reference_for_label('Clone · vui_ve')
+    assert Path(ref_audio).exists()
+    assert Path(ref_audio).name == 'golden_01.wav'
+    assert ref_text == 'Đàn ông và phụ nữ ở bẩn thì sẽ có đôi chút khác biệt'
 
 

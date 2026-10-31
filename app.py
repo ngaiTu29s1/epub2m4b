@@ -11,10 +11,14 @@ from core.text_normalizer import normalize_vi_text
 from core.tts_engine import (
     ChapterAudioResult,
     EdgeTTSEngine,
-    F5TTSEngine,
     TTSEngine,
-    ViterboxTTSEngine,
+    VieNeuEngine,
     render_chapter,
+)
+from core.vieneu_engine import (
+    DEFAULT_PRESET_VOICE,
+    build_voice_catalogue,
+    list_available_preset_voices,
 )
 from core.voice_harvester import harvest_voice_from_youtube, list_harvested_voices
 
@@ -100,15 +104,15 @@ def handle_harvest_voice(
     target_minutes: float = 6.0,
     max_videos: int = 1,
 ):
-    """Run the auto harvester and return a summary, the golden ref, and table rows.
+    """Run the auto harvester and return a summary plus the profiles table.
 
-    Returns ``(summary, golden_ref_wav, golden_ref_text, rows)`` where ``rows``
-    is the Gradio ``Dataframe`` value (one row per harvested voice profile).
+    Returns ``(summary, rows)`` where ``rows`` is the Gradio ``Dataframe``
+    value (one row per harvested voice profile).
     """
     voice_id = (voice_id or '').strip()
     query_or_url = (query_or_url or '').strip()
     if not voice_id or not query_or_url:
-        return '⚠️ Cần nhập Voice ID và từ khóa/URL YouTube.', None, '', _voice_table_rows()
+        return '⚠️ Cần nhập Voice ID và từ khóa/URL YouTube.', _voice_table_rows()
 
     logger.info(f'🎙️ [HARVEST_UI] Bắt đầu cào giọng "{voice_id}" từ "{query_or_url}"')
     try:
@@ -121,44 +125,15 @@ def handle_harvest_voice(
         )
     except Exception as exc:  # never let a UI action crash the whole Gradio app
         logger.exception('❌ [HARVEST_UI] Cào giọng thất bại')
-        return f'❌ Cào giọng thất bại: {exc}', None, '', _voice_table_rows()
+        return f'❌ Cào giọng thất bại: {exc}', _voice_table_rows()
 
-    profile = _read_voice_profile(result.voice_dir)
-    golden_wav = profile['golden_ref_wav']
     summary = (
         f'✅ Đã cào xong "{voice_id}": {len(result.kept_clips)} câu / '
         f'{result.total_clean_sec / 60.0:.1f} phút sạch. '
-        f'Đã xuất `metadata.csv` (F5-TTS) và `gpt_sovits.list` (GPT-SoVITS).'
+        f'Giọng này sẵn sàng cho chế độ Instant Clone (chọn "Clone · {voice_id}" trong dropdown giọng đọc).'
     )
     logger.info(f'✅ [HARVEST_UI] {summary}')
-    return summary, golden_wav or None, profile['golden_ref_text'], _voice_table_rows()
-
-
-def handle_select_harvested_voice(voice_id: str | None):
-    """Load a harvested profile and auto-populate the F5-TTS reference fields.
-
-    Returns ``(voice_choices_update, summary, golden_ref_wav, golden_ref_text)``.
-    """
-    voices = list_harvested_voices(Path(VOICES_ROOT))
-    choices = [v['voice_id'] for v in voices]
-    selected = next((v for v in voices if v['voice_id'] == voice_id), None)
-    if selected is None:
-        return gr.update(choices=choices), '', None, ''
-
-    summary = (
-        f"🎙️ **{selected['voice_id']}** — {selected['num_clips']} câu / "
-        f"{selected['total_clean_minutes']:.1f} phút sạch "
-        f"({len(selected['processed_video_ids'])} video đã xử lý)"
-    )
-    if not selected['golden_ref_wav']:
-        summary += '\n⚠️ Chưa có golden reference — hãy cào thêm hoặc kiểm tra lại thư mục.'
-    logger.info(f'🎙️ [VOICE_SELECT] Nạp profile "{selected["voice_id"]}" vào Khu vực 2 (F5-TTS)')
-    return (
-        gr.update(choices=choices),
-        summary,
-        selected['golden_ref_wav'] or None,
-        selected['golden_ref_text'],
-    )
+    return summary, _voice_table_rows()
 
 
 def _read_voice_profile(voice_dir: Path) -> dict:
@@ -193,6 +168,38 @@ def _harvested_voice_ids() -> list[str]:
 def _load_harvested_voices():
     """Populate the harvester table and dropdown when the app loads."""
     return _voice_table_rows(), gr.update(choices=_harvested_voice_ids())
+
+
+def _refresh_all_voices():
+    """Refresh the reading-voice dropdown plus the harvest table/dropdown."""
+    rows, harvested_update = _load_harvested_voices()
+    return _refresh_vieneu_voice_choices(), rows, harvested_update
+
+
+def _vieneu_voice_choices() -> list[str]:
+    """Dropdown labels for every VieNeu voice: presets + classic + clones.
+
+    Uses the static fallback list so building the UI never triggers a model
+    download; ``refresh_voices_btn`` repopulates the full catalogue on demand.
+    """
+    from core.vieneu_engine import FALLBACK_PRESET_VOICES
+
+    labels = [f'Giọng sẵn có · {name}' for name in FALLBACK_PRESET_VOICES]
+    labels.append('Nguyễn Ngọc Ngạn (kinh điển)')
+    labels.append('Clone · Vui Vẻ')
+    labels.append('Clone · WAV của bạn')
+    return labels
+
+
+def _refresh_vieneu_voice_choices():
+    """Build the full catalogue (may download the model) on explicit refresh."""
+    try:
+        labels = [o.label for o in build_voice_catalogue()]
+        if labels:
+            return gr.update(choices=labels)
+    except Exception as exc:  # pragma: no cover - offline fallback
+        logger.warning(f'⚠️ [VOICES] Không dựng được catalogue đầy đủ ({exc}).')
+    return gr.update(choices=_vieneu_voice_choices())
 
 
 def _voice_table_rows() -> list[list[str]]:
@@ -248,31 +255,50 @@ def _create_tts_engine(
     engine_choice: str,
     voice_choice: str,
     rate_pct: int,
-    rvc_pth: str = '',
-    rvc_index: str = '',
-    f5_ref_audio: str | None = None,
-    f5_ref_text: str = '',
+    clone_ref_audio: str | None = None,
+    clone_ref_text: str = '',
 ) -> TTSEngine:
     rate_str = f'{int(rate_pct):+d}%'
-    if 'Viterbox' in engine_choice:
-        # Viterbox reads Vietnamese directly and clones the Vui Vẻ timbre from
-        # the golden reference; the tuned defaults in ViterboxTTSEngine give a
-        # calm, clearly-articulated pace.
-        return ViterboxTTSEngine()
-    if 'F5-TTS' in engine_choice:
-        if not f5_ref_audio:
-            raise ValueError('Vui lòng tải lên file audio mẫu (10-15s) cho F5-TTS.')
-        return F5TTSEngine(ref_audio=Path(f5_ref_audio), ref_text=f5_ref_text)
-    if 'RVC' in engine_choice:
-        if not rvc_pth:
-            raise ValueError('Vui lòng nhập đường dẫn file model .pth cho chế độ Edge-TTS + RVC.')
-        return EdgeTTSEngine(
-            voice=voice_choice,
-            rate=rate_str,
-            rvc_model_path=Path(rvc_pth),
-            rvc_index_path=Path(rvc_index) if rvc_index else None,
+
+    if 'Edge-TTS' in engine_choice:
+        return EdgeTTSEngine(voice=voice_choice or 'vi-VN-NamMinhNeural', rate=rate_str)
+
+    # Default and preferred engine: VieNeu-TTS v3 Turbo.
+    label = (voice_choice or '').strip()
+    if label.startswith('Clone · WAV') or label.startswith('Clone · wav'):
+        return VieNeuEngine(
+            mode='clone',
+            ref_audio=clone_ref_audio or None,
+            ref_text=clone_ref_text or None,
         )
-    return EdgeTTSEngine(voice=voice_choice, rate=rate_str)
+    if label.startswith('Clone ·'):
+        # A named harvested profile / bundled clone (e.g. Vui Vẻ).
+        ref_audio, ref_text = _clone_reference_for_label(label)
+        return VieNeuEngine(mode='clone', ref_audio=ref_audio, ref_text=ref_text)
+    if label.startswith('Nguyễn Ngọc Ngạn'):
+        return VieNeuEngine(mode='classic')
+    if label.startswith('Giọng sẵn có ·'):
+        return VieNeuEngine(mode='preset', voice=label.split('·', 1)[1].strip())
+    if label and not label.startswith('Clone ·'):
+        # The dropdown was replaced (or a test passed a raw preset name).
+        return VieNeuEngine(mode='preset', voice=label)
+    return VieNeuEngine(mode='preset', voice=DEFAULT_PRESET_VOICE)
+
+
+def _clone_reference_for_label(label: str) -> tuple[Path | None, str | None]:
+    """Resolve a ``Clone · <name>`` dropdown label to a reference WAV + text."""
+    name = label.split('·', 1)[1].strip() if '·' in label else ''
+    key = name.lower().replace(' ', '_')
+    for option in build_voice_catalogue():
+        if option.mode == 'clone' and option.ref_audio and option.label.split('·', 1)[1].strip().lower() == name.lower():
+            return option.ref_audio, option.ref_text
+    voice_dir = Path(VOICES_ROOT) / key
+    if voice_dir.exists():
+        profile = _read_voice_profile(voice_dir)
+        ref_wav = profile.get('golden_ref_wav')
+        if ref_wav:
+            return Path(ref_wav), profile.get('golden_ref_text')
+    return None, None
 
 
 def handle_preview_tts(
@@ -280,10 +306,8 @@ def handle_preview_tts(
     engine_choice: str,
     voice_choice: str,
     rate_pct: int,
-    rvc_pth: str,
-    rvc_index: str,
-    f5_ref_audio: str | None,
-    f5_ref_text: str,
+    clone_ref_audio: str | None,
+    clone_ref_text: str,
 ) -> str | None:
     cleaned = normalize_vi_text(sample_text or '')
     if not cleaned:
@@ -294,10 +318,8 @@ def handle_preview_tts(
             engine_choice=engine_choice,
             voice_choice=voice_choice,
             rate_pct=rate_pct,
-            rvc_pth=rvc_pth,
-            rvc_index=rvc_index,
-            f5_ref_audio=f5_ref_audio,
-            f5_ref_text=f5_ref_text,
+            clone_ref_audio=clone_ref_audio,
+            clone_ref_text=clone_ref_text,
         )
         preview_dir = DEFAULT_WORKSPACE / '_preview'
         preview_dir.mkdir(parents=True, exist_ok=True)
@@ -337,10 +359,8 @@ def handle_generate_m4b(
     engine_choice: str,
     voice_choice: str,
     rate_pct: int,
-    rvc_pth: str,
-    rvc_index: str,
-    f5_ref_audio: str | None,
-    f5_ref_text: str,
+    clone_ref_audio: str | None,
+    clone_ref_text: str,
     force_rerender: bool = False,
     progress=gr.Progress(),
 ):
@@ -364,10 +384,8 @@ def handle_generate_m4b(
         engine_choice=engine_choice,
         voice_choice=voice_choice,
         rate_pct=rate_pct,
-        rvc_pth=rvc_pth,
-        rvc_index=rvc_index,
-        f5_ref_audio=f5_ref_audio,
-        f5_ref_text=f5_ref_text,
+        clone_ref_audio=clone_ref_audio,
+        clone_ref_text=clone_ref_text,
     )
 
     chaps_out_dir = book_dir / 'chapters_audio'
@@ -444,23 +462,14 @@ def build_app() -> gr.Blocks:
                         engine_choice = gr.Radio(
                             label='Chế độ Engine',
                             choices=[
-                                'Viterbox Zero-shot TTS (Giọng Vui Vẻ)',
-                                'Edge-TTS (Siêu nhanh)',
-                                'F5-TTS Clone (Nhân bản giọng RTX 3060)',
-                                'Edge-TTS + RVC (Đổi màu giọng RTX 3060)',
+                                'VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)',
+                                'Edge-TTS (Siêu nhanh, không cần GPU)',
                             ],
-                            value='Viterbox Zero-shot TTS (Giọng Vui Vẻ)' if 'vui_ve' in _harvested_voice_ids() else 'Edge-TTS (Siêu nhanh)',
-                        )
-
-                    with gr.Row(visible=not ('vui_ve' in _harvested_voice_ids())) as edge_controls:
-                        voice_choice = gr.Dropdown(
-                            label='Giọng đọc cơ sở (Microsoft Edge Neural)',
-                            choices=['vi-VN-NamMinhNeural', 'vi-VN-HoaiMyNeural'],
-                            value='vi-VN-NamMinhNeural',
-                            scale=2,
+                            value='VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)',
+                            scale=1,
                         )
                         rate_slider = gr.Slider(
-                            label='Tốc độ đọc (%)',
+                            label='Tốc độ đọc (%) — chỉ áp dụng cho Edge-TTS',
                             minimum=-30,
                             maximum=50,
                             step=5,
@@ -468,42 +477,31 @@ def build_app() -> gr.Blocks:
                             scale=1,
                         )
 
-                    # Khối cấu hình F5-TTS hiển thị rõ ràng ngay tại Khu vực 2
-                    vui_ve_init = _read_voice_profile(Path(VOICES_ROOT) / 'vui_ve') if 'vui_ve' in _harvested_voice_ids() else {}
-                    with gr.Group(visible='vui_ve' in _harvested_voice_ids()) as f5_controls:
-                        gr.Markdown('#### 🎙️ Nhân bản giọng F5-TTS (Zero-shot Voice Cloning trên GPU RTX 3060)')
-                        with gr.Row():
-                            harvested_voice_dropdown = gr.Dropdown(
-                                label='Profile giọng đã cào (chọn để nạp vào Khu vực 2)',
-                                choices=_harvested_voice_ids(),
-                                value='vui_ve' if 'vui_ve' in _harvested_voice_ids() else None,
-                                interactive=True,
-                                scale=3,
-                            )
-                            refresh_voices_btn = gr.Button('🔄 Làm mới danh sách giọng', scale=1)
-                        harvested_summary = gr.Markdown(
-                            '🎙️ **vui_ve** — 226 câu / 26.7 phút sạch (đã nạp Golden Ref)'
-                            if 'vui_ve' in _harvested_voice_ids() else ''
+                    with gr.Row():
+                        voice_choice = gr.Dropdown(
+                            label='🎙️ Chọn giọng đọc',
+                            choices=_vieneu_voice_choices(),
+                            value=_vieneu_voice_choices()[0] if _vieneu_voice_choices() else DEFAULT_PRESET_VOICE,
+                            interactive=True,
+                            scale=3,
+                        )
+                        refresh_voices_btn = gr.Button('🔄 Làm mới danh sách giọng', scale=1)
+
+                    with gr.Group(visible=False) as clone_controls:
+                        gr.Markdown(
+                            '#### 🧬 Instant Clone — tải lên file WAV mẫu (8–15s)'
                         )
                         with gr.Row():
-                            f5_ref_audio = gr.Audio(
-                                label='Audio mẫu Golden Reference (5–10s)',
-                                value=vui_ve_init.get('golden_ref_wav') or None,
+                            clone_ref_audio = gr.Audio(
+                                label='Audio mẫu cho Instant Clone (WAV sạch, 8–15s)',
                                 type='filepath',
                                 scale=1,
                             )
-                            f5_ref_text = gr.Textbox(
-                                label='Transcript khớp với Audio mẫu F5-TTS',
-                                value=vui_ve_init.get('golden_ref_text') or '',
+                            clone_ref_text = gr.Textbox(
+                                label='Transcript khớp với Audio mẫu (nên điền để bám giọng sát hơn)',
                                 lines=4,
                                 scale=2,
                             )
-
-                    with gr.Group(visible=False) as rvc_controls:
-                        gr.Markdown('#### 🎛️ Cấu hình RVC v2 Voice Conversion')
-                        with gr.Row():
-                            rvc_pth = gr.Textbox(label='Đường dẫn model RVC (.pth)', placeholder='/path/to/voice.pth')
-                            rvc_index = gr.Textbox(label='Đường dẫn file RVC (.index)', placeholder='/path/to/voice.index')
 
                     with gr.Row():
                         preview_text = gr.Textbox(
@@ -564,6 +562,12 @@ def build_app() -> gr.Blocks:
                                 '🚀 Bắt đầu Cào & Tuyển chọn Giọng', variant='primary'
                             )
                         with gr.Column(scale=2):
+                            harvested_voice_dropdown = gr.Dropdown(
+                                label='Profile giọng đã cào (dùng cho Instant Clone)',
+                                choices=_harvested_voice_ids(),
+                                value='vui_ve' if 'vui_ve' in _harvested_voice_ids() else None,
+                                interactive=True,
+                            )
                             harvest_status = gr.Textbox(label='Trạng thái cào giọng', interactive=False)
                             harvest_table = gr.Dataframe(
                                 headers=['Voice ID', 'Số câu', 'Phút sạch', 'Golden ref'],
@@ -573,20 +577,13 @@ def build_app() -> gr.Blocks:
                                 interactive=False,
                             )
 
-        def toggle_engine_ui(choice: str):
-            is_f5 = 'F5-TTS' in choice
-            is_rvc = 'RVC' in choice
-            is_edge = not is_f5 and not is_rvc
-            return (
-                gr.update(visible=is_edge or is_rvc),
-                gr.update(visible=is_f5),
-                gr.update(visible=is_rvc),
-            )
+        def toggle_voice_ui(label: str):
+            return gr.update(visible='Clone' in (label or ''))
 
-        engine_choice.change(
-            fn=toggle_engine_ui,
-            inputs=[engine_choice],
-            outputs=[edge_controls, f5_controls, rvc_controls],
+        voice_choice.change(
+            fn=toggle_voice_ui,
+            inputs=[voice_choice],
+            outputs=[clone_controls],
         )
         epub_input.change(
             fn=handle_epub_upload,
@@ -596,17 +593,12 @@ def build_app() -> gr.Blocks:
         harvest_btn.click(
             fn=handle_harvest_voice,
             inputs=[harvest_voice_id, harvest_query, harvest_minutes, harvest_max_videos],
-            outputs=[harvest_status, f5_ref_audio, f5_ref_text, harvest_table],
-        )
-        harvested_voice_dropdown.change(
-            fn=handle_select_harvested_voice,
-            inputs=[harvested_voice_dropdown],
-            outputs=[harvested_voice_dropdown, harvested_summary, f5_ref_audio, f5_ref_text],
+            outputs=[harvest_status, harvest_table],
         )
         refresh_voices_btn.click(
-            fn=_load_harvested_voices,
+            fn=_refresh_all_voices,
             inputs=None,
-            outputs=[harvest_table, harvested_voice_dropdown],
+            outputs=[voice_choice, harvest_table, harvested_voice_dropdown],
         )
         demo.load(
             fn=_load_harvested_voices,
@@ -635,10 +627,8 @@ def build_app() -> gr.Blocks:
                 engine_choice,
                 voice_choice,
                 rate_slider,
-                rvc_pth,
-                rvc_index,
-                f5_ref_audio,
-                f5_ref_text,
+                clone_ref_audio,
+                clone_ref_text,
             ],
             outputs=[preview_audio],
         )
@@ -652,10 +642,8 @@ def build_app() -> gr.Blocks:
                 engine_choice,
                 voice_choice,
                 rate_slider,
-                rvc_pth,
-                rvc_index,
-                f5_ref_audio,
-                f5_ref_text,
+                clone_ref_audio,
+                clone_ref_text,
                 force_checkbox,
             ],
             outputs=[m4b_player, m4b_download, vtt_download, timeline_table, status_box],

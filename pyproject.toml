@@ -18,6 +18,9 @@ dependencies = [
     "nvidia-cudnn-cu12>=9.27.0.42",
     "soundfile>=0.14.0",
     "static-ffmpeg>=3.0",
+    "torch>=2.9.1",
+    "tiktoken>=0.12.0",
+    "vieneu>=3.8.3",
     "yt-dlp>=2026.10.26",
 ]
 
@@ -37,3 +40,7 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ['.']
 testpaths = ['tests']
+filterwarnings = [
+    'ignore::bs4.XMLParsedAsHTMLWarning',
+    'ignore::FutureWarning:torch',
+]
