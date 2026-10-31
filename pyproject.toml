@@ -10,11 +10,18 @@ dependencies = [
     "beautifulsoup4>=4.15.0",
     "ebooklib>=0.20",
     "edge-tts>=7.3.1",
+    "faster-whisper>=1.2.1",
     "gradio>=6.30.0",
     "lxml>=6.1.3",
     "numpy>=2.5.4",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cudnn-cu12>=9.27.0.42",
     "soundfile>=0.14.0",
     "static-ffmpeg>=3.0",
+    "torch>=2.9.1",
+    "tiktoken>=0.12.0",
+    "vieneu>=3.8.3",
+    "yt-dlp>=2026.10.26",
 ]
 
 [project.scripts]
@@ -32,3 +39,8 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ['.']
+testpaths = ['tests']
+filterwarnings = [
+    'ignore::bs4.XMLParsedAsHTMLWarning',
+    'ignore::FutureWarning:torch',
+]

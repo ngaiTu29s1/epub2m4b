@@ -1,9 +1,12 @@
+import logging
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 from core.models import BookMetadata
 from core.tts_engine import ChapterAudioResult
+
+logger = logging.getLogger('epub2m4b.packager')
 
 
 def _get_ffmpeg_bin() -> str:
@@ -68,7 +71,9 @@ def export_webvtt(chapters: list[ChapterAudioResult], out_vtt: Path) -> Path:
             lines.append('')
             cue_idx += 1
         offset_ms += ch.duration_ms
+    total_cues = sum(len(ch.cues) for ch in chapters)
     out_vtt.write_text('\n'.join(lines), encoding='utf-8')
+    logger.info(f'📝 [VTT] Xuất file phụ đề WebVTT ({total_cues} cues) -> {out_vtt.name}')
     return out_vtt
 
 
@@ -78,6 +83,7 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
     out_m4b = Path(out_m4b)
     out_m4b.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_bin = _get_ffmpeg_bin()
+    logger.info(f'🎬 [FFMPEG] Bắt đầu ghép {len(chapters)} chương vào file {out_m4b.name}...')
 
     with tempfile.TemporaryDirectory() as tmpd:
         tmp_dir = Path(tmpd)
@@ -118,4 +124,5 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
         cmd.extend(['-movflags', '+faststart', str(out_m4b)])
         subprocess.run(cmd, check=True)
 
+    logger.info(f'✨ [FFMPEG] Đóng gói thành công file sách nói: {out_m4b}')
     return out_m4b

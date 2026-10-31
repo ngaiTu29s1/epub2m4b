@@ -4,7 +4,8 @@ __pycache__/
 .pytest_cache/
 .superpowers/
 workspace/
-models/
+/models/
+voices/
 *.m4b
 *.wav
 *.vtt

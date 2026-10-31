@@ -1,3 +1,9 @@
+"""Chuẩn hoá văn bản tiếng Việt cho TTS (miền Bắc).
+
+Chuyển số, số La Mã, ngày tháng, đơn vị và viết tắt sang **chữ tiếng Việt
+thuần** để giọng đọc không bao giờ đọc sai (ví dụ ``Chương IV`` đọc thành
+"chương bốn" chứ không phải "chương i vê").
+"""
 import re
 import unicodedata
 import warnings
@@ -5,6 +11,537 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from core.models import AudioSegmentSpec
 
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
+# ---------------------------------------------------------------------------
+# Số → chữ tiếng Việt (chuẩn miền Bắc)
+# ---------------------------------------------------------------------------
+_DIGIT_WORDS = {
+    0: 'không', 1: 'một', 2: 'hai', 3: 'ba', 4: 'bốn', 5: 'năm',
+    6: 'sáu', 7: 'bảy', 8: 'tám', 9: 'chín',
+}
+_SCALE_WORDS = {3: 'nghìn', 6: 'triệu', 9: 'tỷ', 12: 'nghìn tỷ', 15: 'triệu tỷ'}
+
+
+def _read_group_of_three(n: int, *, full: bool) -> str:
+    """Đọc một nhóm 0..999.
+
+    ``full=True`` luôn đọc đủ, kể cả nhóm đứng giữa câu (``một trăm linh năm``).
+    ``full=False`` dùng cho nhóm cao nhất (không có tiền tố, không có "linh").
+    """
+    words: list[str] = []
+    hundreds = n // 100
+    tens = (n // 10) % 10
+    units = n % 10
+
+    if hundreds > 0 or full:
+        words.append(f'{_DIGIT_WORDS[hundreds]} trăm')
+        if tens == 0 and units > 0:
+            words.append('linh')
+
+    if tens > 1:
+        words.append(f'{_DIGIT_WORDS[tens]} mươi')
+        if units == 1:
+            words.append('mốt')
+        elif units == 4:
+            words.append('tư')
+        elif units == 5:
+            words.append('lăm')
+        elif units > 0:
+            words.append(_DIGIT_WORDS[units])
+    elif tens == 1:
+        words.append('mười')
+        if units == 1:
+            words.append('một')
+        elif units == 5:
+            words.append('lăm')
+        elif units > 0:
+            words.append(_DIGIT_WORDS[units])
+    elif units > 0:
+        # Sau "linh" (hàng chục = 0), tiếng Việt chuẩn đọc là "linh một",
+        # "linh tư", "linh năm" (không đọc "linh mốt" hay "linh lăm").
+        if hundreds > 0 or full:
+            if units == 4:
+                words.append('tư')
+            else:
+                words.append(_DIGIT_WORDS[units])
+        else:
+            words.append(_DIGIT_WORDS[units])
+
+    return ' '.join(w for w in words if w)
+
+
+def number_to_words_vi(number: int) -> str:
+    """Đọc số nguyên thành chữ tiếng Việt miền Bắc chuẩn.
+
+    >>> number_to_words_vi(1990)
+    'một nghìn chín trăm chín mươi'
+    >>> number_to_words_vi(105)
+    'một trăm linh năm'
+    >>> number_to_words_vi(21)
+    'hai mươi mốt'
+    """
+    number = int(number)
+    if number == 0:
+        return 'không'
+    if number < 0:
+        return 'âm ' + number_to_words_vi(-number)
+
+    groups: list[int] = []
+    while number > 0:
+        groups.append(number % 1000)
+        number //= 1000
+
+    parts: list[str] = []
+    for idx in range(len(groups) - 1, -1, -1):
+        group = groups[idx]
+        if group == 0:
+            continue
+        is_most_significant = not parts
+        text = _read_group_of_three(group, full=not is_most_significant)
+        scale = _SCALE_WORDS.get(idx * 3) if idx > 0 else None
+        parts.append(f'{text} {scale}' if scale else text)
+    return ' '.join(parts)
+
+
+def _read_decimal(digits: str) -> str:
+    """Đọc phần thập phân theo từng chữ số (``1,5`` → "một phẩy năm")."""
+    return ' '.join(_DIGIT_WORDS[int(d)] for d in digits if d.isdigit())
+
+
+# ---------------------------------------------------------------------------
+# Số La Mã
+# ---------------------------------------------------------------------------
+_ROMAN_VALUES = (
+    ('M', 1000), ('CM', 900), ('D', 500), ('CD', 400),
+    ('C', 100), ('XC', 90), ('L', 50), ('XL', 40),
+    ('X', 10), ('IX', 9), ('V', 5), ('IV', 4), ('I', 1),
+)
+_ROMAN_VALID_RE = re.compile(r'^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$')
+
+
+def roman_to_int(roman: str) -> int | None:
+    """Chuyển số La Mã chuẩn tắc thành int, trả ``None`` nếu không hợp lệ."""
+    text = roman.upper().strip()
+    if not text or not _ROMAN_VALID_RE.match(text):
+        return None
+    value = 0
+    idx = 0
+    for sym, val in _ROMAN_VALUES:
+        while text.startswith(sym, idx):
+            value += val
+            idx += len(sym)
+    return value if idx == len(text) else None
+
+
+def roman_to_words_vi(roman: str) -> str | None:
+    value = roman_to_int(roman)
+    return number_to_words_vi(value) if value else None
+
+
+# Chỉ các danh từ đứng trước mới được phép coi token La Mã là số thứ tự.
+_ROMAN_PREFIX = (
+    r'chương|phần|quyển|tập|hồi|mục|tiết|chương trình|điều|khoản|'
+    r'thế kỷ|thiên niên kỷ|vương triều|đời|triều đại|tập phim|kỳ|kì|'
+    r'quân đoàn|chiến dịch|liên đoàn|olympic|thế vận hội'
+)
+_ROMAN_AFTER_PREFIX_RE = re.compile(
+    rf'\b((?:{_ROMAN_PREFIX})\s+)([IVXLCDM]{{1,6}})\b',
+    re.IGNORECASE,
+)
+# Đề mục đứng ở đầu dòng/dấu câu: "I. Khởi đầu", "IV - Kết thúc"
+_ROMAN_HEADING_RE = re.compile(
+    r'(?:(?<=^)|(?<=[\n\.;:!?]\s)|(?<=\n))([IVXLCDM]{1,6})(?=[\.\)\-–—:]\s)',
+    re.MULTILINE,
+)
+
+
+# ---------------------------------------------------------------------------
+# Ngày tháng năm
+# ---------------------------------------------------------------------------
+def _day_to_words(day: int) -> str:
+    """``19`` → "mười chín", ``21`` → "hai mươi mốt", ``15`` → "mười lăm"."""
+    if day == 1:
+        return 'mồng một'
+    return number_to_words_vi(day)
+
+
+_MONTH_WORDS = {
+    1: 'giêng', 2: 'hai', 3: 'ba', 4: 'tư', 5: 'năm', 6: 'sáu',
+    7: 'bảy', 8: 'tám', 9: 'chín', 10: 'mười', 11: 'mười một', 12: 'mười hai',
+}
+_ORDINAL_MONTH_WORDS = {
+    1: 'nhất', 2: 'hai', 3: 'ba', 4: 'tư', 5: 'năm', 6: 'sáu',
+    7: 'bảy', 8: 'tám', 9: 'chín', 10: 'mười', 11: 'mười một', 12: 'mười hai',
+}
+_ORDINAL_WEEKDAY = {
+    2: 'hai', 3: 'ba', 4: 'tư', 5: 'năm', 6: 'sáu', 7: 'bảy', 8: 'chủ nhật',
+}
+
+
+def _month_words(month: int) -> str:
+    return _MONTH_WORDS.get(month, number_to_words_vi(month))
+
+
+def _normalize_full_date(text: str) -> str:
+    """``19/05/1990`` → "mười chín tháng năm năm một nghìn chín trăm chín mươi"."""
+
+    def repl(m: re.Match) -> str:
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if not (1 <= day <= 31 and 1 <= month <= 12):
+            return m.group(0)
+        return (
+            f'{_day_to_words(day)} tháng {_month_words(month)} '
+            f'năm {number_to_words_vi(year)}'
+        )
+
+    return re.sub(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', repl, text)
+
+
+def _normalize_short_date(text: str) -> str:
+    """``19/05`` → "mười chín tháng năm" (chỉ khi hợp lệ như một ngày)."""
+
+    def repl(m: re.Match) -> str:
+        day, month = int(m.group(1)), int(m.group(2))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return f'{_day_to_words(day)} tháng {_month_words(month)}'
+        return m.group(0)
+
+    return re.sub(r'\b(\d{1,2})/(\d{1,2})\b', repl, text)
+
+
+def _normalize_standalone_year(text: str) -> str:
+    """Năm đứng một mình (``năm 1990``, ``năm 1945``) đọc đủ theo nhóm nghìn."""
+
+    def repl(m: re.Match) -> str:
+        return f'năm {number_to_words_vi(int(m.group(1)))}'
+
+    return re.sub(r'\bnăm\s+(\d{4})\b', repl, text, flags=re.IGNORECASE)
+
+
+def _normalize_month_ref(text: str) -> str:
+    """``tháng 4`` → "tháng tư"; ``tháng 12`` → "tháng mười hai"."""
+
+    def repl(m: re.Match) -> str:
+        month = int(m.group(1))
+        return f'tháng {_month_words(month)}' if 1 <= month <= 12 else m.group(0)
+
+    text = re.sub(r'\btháng\s+(\d{1,2})\b', repl, text, flags=re.IGNORECASE)
+
+    def repl_year(m: re.Match) -> str:
+        return f'tháng {_month_words(int(m.group(1)))} năm {number_to_words_vi(int(m.group(2)))}'
+
+    return re.sub(
+        r'\btháng\s+(\d{1,2})\s*[/-]\s*(\d{4})\b', repl_year, text, flags=re.IGNORECASE
+    )
+
+
+def _normalize_ordinal_day(text: str) -> str:
+    """``thứ 4`` → "thứ tư"; ``ngày 2/9`` đã được xử lý ở nhánh ngày tháng."""
+
+    def repl(m: re.Match) -> str:
+        day = int(m.group(1))
+        return f'thứ {_ORDINAL_WEEKDAY[day]}' if day in _ORDINAL_WEEKDAY else m.group(0)
+
+    return re.sub(r'\bthứ\s+(\d{1,2})\b', repl, text, flags=re.IGNORECASE)
+
+
+def _normalize_lunar(text: str) -> str:
+    """``mùng 1`` / ``mồng 1 tháng Giêng`` → chữ."""
+
+    def repl(m: re.Match) -> str:
+        return f'{m.group(1)} {number_to_words_vi(int(m.group(2)))}'
+
+    return re.sub(r'\b(mùng|mồng)\s+(\d{1,2})\b', repl, text, flags=re.IGNORECASE)
+
+
+def _normalize_clock(text: str) -> str:
+    """``14h30`` / ``14:30`` / ``7h`` / ``7 giờ 30`` → "mười bốn giờ ba mươi phút".
+
+    Chỉ áp dụng cho giờ hợp lệ 0-23; ``07:05`` đọc "bảy giờ không mươi lăm phút".
+    Dấu ``:`` bắt buộc phải có phút (tránh ``Chương 1:`` bị đọc thành "giờ").
+    """
+
+    def repl(m: re.Match) -> str:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return m.group(0)
+        out = f'{number_to_words_vi(hour)} giờ'
+        if m.group(2) is not None:
+            out += f' {number_to_words_vi(minute)} phút'
+        return out
+
+    # `h`/`g` không cần phút; dấu `:` bắt buộc phải có 2 chữ số phút.
+    text = re.sub(r'\b(\d{1,2})\s*[hg]\s*(\d{2})?\b', repl, text, flags=re.IGNORECASE)
+    text = re.sub(r'(?<![\d:])(\d{1,2}):(\d{2})(?![\d:])', repl, text)
+    return text
+
+
+def _normalize_number_range(text: str) -> str:
+    """``6-7 mét`` / ``10 - 20`` → "sáu đến bảy mét" (giữ nguyên đơn vị đi kèm)."""
+
+    def repl(m: re.Match) -> str:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if hi <= lo:
+            return m.group(0)
+        return f'{number_to_words_vi(lo)} đến {number_to_words_vi(hi)}'
+
+    return re.sub(r'\b(\d{1,4})\s*[-–—]\s*(\d{1,4})\b', repl, text)
+
+
+def _normalize_digit_code(text: str) -> str:
+    """Mã số nhiều chữ số đọc từng chữ: ``007`` → "không không bảy".
+
+    Chỉ áp dụng cho chuỗi >= 3 chữ số có số 0 đứng đầu (mã/mã hiệu), không áp
+    dụng cho số thông thường hay năm.
+    """
+
+    def repl(m: re.Match) -> str:
+        digits = m.group(0)
+        return ' '.join(number_to_words_vi(int(d)) for d in digits)
+
+    return re.sub(r'(?<![\d\w.,])0\d{2,}(?!\d)', repl, text)
+
+
+
+# ---------------------------------------------------------------------------
+# Đơn vị & đo lường
+# ---------------------------------------------------------------------------
+# 1m76 -> một mét bảy mươi sáu   |   1,76m -> một phẩy bảy mươi sáu mét
+_METERS_RE = re.compile(r'\b(\d+)\s*m\s*(\d{1,2})\b', re.IGNORECASE)
+_DECIMAL_METERS_RE = re.compile(r'\b(\d+[.,]\d+)\s*m\b', re.IGNORECASE)
+_CENTIMETERS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:cm|centimet)\b', re.IGNORECASE)
+_KILOGRAMS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:kg|kí|kilôgam|kilogram)\b', re.IGNORECASE)
+_GRAMS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:g|gram|gam)\b', re.IGNORECASE)
+_KILOMETERS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*(?:km|kilômét|kilomet)\b', re.IGNORECASE)
+_SQUARE_METERS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*m\s*2\b', re.IGNORECASE)
+_CUBIC_METERS_RE = re.compile(r'\b(\d+(?:[.,]\d+)?)\s*m\s*3\b', re.IGNORECASE)
+_PERCENT_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*%')
+_CURRENCY_RE = re.compile(r'\b(\d[\d.,]*)\s*(?:đ|vnđ|vnd|đồng)\b', re.IGNORECASE)
+_CELSIUS_RE = re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:°\s*c|độ\s*c)\b', re.IGNORECASE)
+
+
+def _read_number_literal(literal: str) -> str:
+    """Đọc một literal số: ``123``, ``1,5``, ``1.5``, ``1.234`` (dấu phân cách)."""
+    literal = literal.strip()
+    if not literal:
+        return literal
+    grouped = re.fullmatch(r'(\d{1,3}(?:[.,]\d{3})+)(?:[.,](\d+))?', literal)
+    if grouped:
+        int_part = re.sub(r'[.,]', '', grouped.group(1))
+        words = number_to_words_vi(int(int_part))
+        frac = grouped.group(2)
+        if frac:
+            return f'{words} phẩy {_read_decimal(frac)}'
+        return words
+    if re.fullmatch(r'\d+', literal):
+        return number_to_words_vi(int(literal))
+    decimal = re.fullmatch(r'(\d+)[.,](\d+)', literal)
+    if decimal:
+        return (
+            f'{number_to_words_vi(int(decimal.group(1)))} '
+            f'phẩy {_read_decimal(decimal.group(2))}'
+        )
+    return literal
+
+
+def _normalize_measurements(text: str) -> str:
+    def meter_repl(m: re.Match) -> str:
+        metres = int(m.group(1))
+        centimetres = int(m.group(2))
+        words = f'{number_to_words_vi(metres)} mét'
+        if centimetres:
+            words += f' {number_to_words_vi(centimetres)}'
+        return words
+
+    # Square/cubic metres must run before the generic ``m`` patterns so that
+    # "20m2" is not split into "20 mét 2".
+    text = _SQUARE_METERS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} mét vuông', text
+    )
+    text = _CUBIC_METERS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} mét khối', text
+    )
+    text = _METERS_RE.sub(meter_repl, text)
+    text = _DECIMAL_METERS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} mét', text
+    )
+    text = _CENTIMETERS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} xăng-ti-mét', text
+    )
+    text = _KILOMETERS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} ki-lô-mét', text
+    )
+    text = _KILOGRAMS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} ki-lô-gam', text
+    )
+    text = _GRAMS_RE.sub(lambda m: f'{_read_number_literal(m.group(1))} gam', text)
+    text = _CURRENCY_RE.sub(lambda m: f'{_read_number_literal(m.group(1))} đồng', text)
+    text = _PERCENT_RE.sub(lambda m: f'{_read_number_literal(m.group(1))} phần trăm', text)
+    text = _CELSIUS_RE.sub(
+        lambda m: f'{_read_number_literal(m.group(1))} độ xê', text
+    )
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Viết tắt
+# ---------------------------------------------------------------------------
+_ABBR_MAP = [
+    (re.compile(r'\bTP\.?\s*HCM\b', re.IGNORECASE), 'Thành phố Hồ Chí Minh'),
+    (re.compile(r'\bTp\.?\s*HCM\b'), 'Thành phố Hồ Chí Minh'),
+    (re.compile(r'\bHCM\b'), 'Hồ Chí Minh'),
+    (re.compile(r'\bHN\b'), 'Hà Nội'),
+    (re.compile(r'\bĐH\b'), 'Đại học'),
+    (re.compile(r'\bNXB\b'), 'Nhà xuất bản'),
+    (re.compile(r'\bPGS\.?\s*TS\.'), 'Phó giáo sư Tiến sĩ '),
+    (re.compile(r'\bGS\.?\s*TS\.'), 'Giáo sư Tiến sĩ '),
+    (re.compile(r'\bPGS\.\s'), 'Phó giáo sư '),
+    (re.compile(r'\bGS\.\s'), 'Giáo sư '),
+    (re.compile(r'\bTS\.\s'), 'Tiến sĩ '),
+    (re.compile(r'\bThS\.\s'), 'Thạc sĩ '),
+    (re.compile(r'\bBS\.\s'), 'Bác sĩ '),
+]
+# Viết tắt cần khoảng trắng/ranh giới phía sau để không cắn vào tên riêng.
+_ABBR_TAIL = [
+    (re.compile(r'\bv\.v\.\.\.'), 'vân vân'),
+    (re.compile(r'\bvv\.\b'), 'vân vân'),
+    (re.compile(r'\bTP\.\s'), 'Thành phố '),
+    (re.compile(r'\bPGS\.\b'), 'Phó giáo sư'),
+    (re.compile(r'\bGS\.\b'), 'Giáo sư'),
+    (re.compile(r'\bTS\.\b'), 'Tiến sĩ'),
+]
+
+# Phiên âm từ ngoại lai thường gặp (đọc theo âm Việt).
+_LOANWORD_MAP = [
+    (re.compile(r'\bInternet\b', re.IGNORECASE), 'in-tơ-nét'),
+    (re.compile(r'\brobot\b', re.IGNORECASE), 'rô-bốt'),
+    (re.compile(r'\bcamera\b', re.IGNORECASE), 'ca-mê-ra'),
+    (re.compile(r'\bNew York\b', re.IGNORECASE), 'Niu Óoc'),
+    (re.compile(r'\bLondon\b', re.IGNORECASE), 'Luân Đôn'),
+    (re.compile(r'\bParis\b', re.IGNORECASE), 'Pa-ri'),
+    (re.compile(r'\bWashington\b', re.IGNORECASE), 'Oa-sinh-tơn'),
+    (re.compile(r'\bTokyo\b', re.IGNORECASE), 'Tô-ky-ô'),
+    (re.compile(r'\bMoscow\b', re.IGNORECASE), 'Mát-xcơ-va'),
+]
+
+# ---------------------------------------------------------------------------
+# Từ tiếng Anh / tên riêng / địa danh phổ biến -> phiên âm Việt hoá tự nhiên
+# ---------------------------------------------------------------------------
+# Thứ tự quan trọng: cụm dài trước (New York) rồi tới từ ngắn.
+_EN_WORD_MAP = [
+    ('New York', 'Niu Óoc'),
+    ('Los Angeles', 'Lốt An-giơ-lét'),
+    ('San Francisco', 'Xan Phran-xi-cô'),
+    ('Washington', 'Oa-sinh-tơn'),
+    ('Paris', 'Pa-ri'),
+    ('London', 'Luân Đôn'),
+    ('Tokyo', 'Tô-ki-ô'),
+    ('Seoul', 'Xê-un'),
+    ('Beijing', 'Bắc Kinh'),
+    ('Moscow', 'Mát-xcơ-va'),
+    ('Berlin', 'Béc-lin'),
+    ('Internet', 'in-tơ-nét'),
+    ('internet', 'in-tơ-nét'),
+    ('email', 'i-mêu'),
+    ('website', 'quép-sai'),
+    ('online', 'ôn-lai'),
+    ('robot', 'rô-bốt'),
+    ('data', 'đa-ta'),
+    ('camera', 'ca-mê-ra'),
+    ('video', 'vi-đê-ô'),
+    ('radio', 'ra-đi-ô'),
+    ('logic', 'lô-gíc'),
+    ('computer', 'com-pu-tơ'),
+    ('software', 'phần mềm'),
+    ('hardware', 'phần cứng'),
+    ('smartphone', 'điện thoại thông minh'),
+    ('TV', 'ti-vi'),
+    ('GDP', 'gi-đe-pe'),
+    ('CEO', 'giám đốc điều hành'),
+    ('USB', 'u ét bê'),
+    ('Wifi', 'oai-fai'),
+    ('wifi', 'oai-fai'),
+]
+_EN_WORD_RE = [
+    (re.compile(rf'(?<![\w-]){re.escape(src)}(?![\w-])', re.IGNORECASE), dst)
+    for src, dst in _EN_WORD_MAP
+]
+
+# ---------------------------------------------------------------------------
+# Số thập phân / phân cách tổng quát
+# ---------------------------------------------------------------------------
+_PERCENT_DONE = '\x00PCT\x00'
+
+# Giờ: 14h30 -> mười bốn giờ ba mươi phút | 7h -> bảy giờ | 14:30 -> mười bốn giờ ba mươi phút
+_TIME_H_RE = re.compile(r'\b(\d{1,2})\s*h\s*(\d{1,2})?\b', re.IGNORECASE)
+_TIME_COLON_RE = re.compile(r'\b(\d{1,2}):(\d{2})\b')
+# Dải số trang/tuổi: 6-7 mét -> sáu đến bảy mét
+_RANGE_RE = re.compile(r'\b(\d+)\s*[-–—]\s*(\d+)\b')
+
+
+def _normalize_time(text: str) -> str:
+    def h_repl(m: re.Match) -> str:
+        hour = int(m.group(1))
+        body = f'{number_to_words_vi(hour)} giờ'
+        if m.group(2):
+            minute = int(m.group(2))
+            min_words = number_to_words_vi(minute)
+            if minute == 0:
+                min_words = 'đúng'
+                return f'{body} {min_words}'
+            if minute % 10 == 0 and minute >= 10:
+                min_words = f'{number_to_words_vi(minute // 10)} mươi'
+            if minute == 15:
+                min_words = 'mười lăm'
+            if minute == 30:
+                min_words = 'ba mươi'
+            body += f' {min_words} phút'
+        return body
+
+    def colon_repl(m: re.Match) -> str:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if hour > 23 or minute > 59:
+            return m.group(0)
+        if minute == 0:
+            return f'{number_to_words_vi(hour)} giờ'
+        return f'{number_to_words_vi(hour)} giờ {number_to_words_vi(minute)} phút'
+
+    text = _TIME_COLON_RE.sub(colon_repl, text)
+    text = _TIME_H_RE.sub(h_repl, text)
+    return text
+
+
+def _normalize_ranges(text: str) -> str:
+    """``6-7`` → "sáu đến bảy" (chỉ khi cả hai vế là số thuần)."""
+
+    def repl(m: re.Match) -> str:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        if lo > hi:
+            return m.group(0)
+        return f'{number_to_words_vi(lo)} đến {number_to_words_vi(hi)}'
+
+    return _RANGE_RE.sub(repl, text)
+
+
+def _normalize_leading_zeros(text: str) -> str:
+    """``007`` → "không không bảy" (đọc từng chữ số cho mã số)."""
+
+    def repl(m: re.Match) -> str:
+        return ' '.join(_DIGIT_WORDS[int(d)] for d in m.group(1))
+
+    return re.sub(r'(?<![\w.,])(0\d+)(?![\w.,])', repl, text)
+
+
+_NUMBER_RE = re.compile(r'(?<![\w])(\d{1,3}(?:[.,]\d{3}){1,3}(?:[.,]\d+)?|\d+[.,]\d+|\d+)')
+
+
+def _normalize_standalone_numbers(text: str) -> str:
+    """Đọc mọi nhóm số còn lại thành chữ (``25`` → "hai mươi lăm")."""
+
+    def repl(m: re.Match) -> str:
+        return _read_number_literal(m.group(1))
+
+    return _NUMBER_RE.sub(repl, text)
+
 
 _VNI_DETECT_RE = re.compile(
     r'(?:Ñ|ñ|ö|Ö|æ|Æ|î|Î|'
@@ -54,6 +591,7 @@ def convert_vni_to_unicode(text: str) -> str:
         text = text.replace(src, dst)
     return unicodedata.normalize('NFC', text)
 
+
 _CHAPTER_HEADING_RE = re.compile(
     r'^(chương|phần|quyển|hồi|tập|mục|giới thiệu|lời mở đầu|lời nói đầu|'
     r'phần dẫn|ngoại truyện|vĩ thanh|lời bạt|lời kết|prologue|epilogue|chapter|part|book)\b',
@@ -64,59 +602,64 @@ _PARA_CHAPTER_RE = re.compile(
     re.IGNORECASE,
 )
 
-_ROMAN_MAP = {
-    'I': 1, 'II': 2, 'III': 3, 'IV': 4, 'V': 5,
-    'VI': 6, 'VII': 7, 'VIII': 8, 'IX': 9, 'X': 10,
-    'XI': 11, 'XII': 12, 'XIII': 13, 'XIV': 14, 'XV': 15,
-    'XVI': 16, 'XVII': 17, 'XVIII': 18, 'XIX': 19, 'XX': 20,
-}
 
-_ABBR_MAP = {
-    r'\bTP\.?\s*HCM\b': 'Thành phố Hồ Chí Minh',
-    r'\bHN\b': 'Hà Nội',
-    r'\bNXB\b': 'Nhà xuất bản',
-    r'\bTS\.\b': 'Tiến sĩ ',
-    r'\bGS\.\b': 'Giáo sư ',
-    r'\bPGS\.\b': 'Phó giáo sư ',
-}
-
-
+# ---------------------------------------------------------------------------
+# Hàm chuẩn hoá chính
+# ---------------------------------------------------------------------------
 def normalize_vi_text(text: str) -> str:
-    # Convert Chương/Phần + Roman numerals -> Arabic numbers
-    def _replace_roman(match: re.Match) -> str:
-        prefix = match.group(1)
-        roman = match.group(2).upper()
-        val = _ROMAN_MAP.get(roman)
-        return f'{prefix} {val}' if val else match.group(0)
+    """Chuẩn hoá text tiếng Việt thành chữ thuần cho TTS."""
+    # 1. Số La Mã sau danh từ thứ tự (Chương IV, thế kỷ XXI…)
+    def _replace_roman(m: re.Match) -> str:
+        words = roman_to_words_vi(m.group(2))
+        return f'{m.group(1)}{words}' if words else m.group(0)
 
-    text = re.sub(
-        r'\b(Chương|Phần|Quyển|Tập|Hồi|Mục)\s+([IVXLCDM]+)\b',
-        _replace_roman,
-        text,
-        flags=re.IGNORECASE,
-    )
+    text = _ROMAN_AFTER_PREFIX_RE.sub(_replace_roman, text)
 
-    # Convert dd/mm/yyyy -> d tháng m năm yyyy
-    def _replace_full_date(m: re.Match) -> str:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        return f'{d} tháng {mo} năm {y}'
+    # 2. Đề mục La Mã ở đầu dòng ("I. Mở đầu")
+    def _replace_roman_heading(m: re.Match) -> str:
+        words = roman_to_words_vi(m.group(1))
+        return words if words else m.group(0)
 
-    text = re.sub(r'\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b', _replace_full_date, text)
+    text = _ROMAN_HEADING_RE.sub(_replace_roman_heading, text)
 
-    # Convert dd/mm -> d tháng m
-    def _replace_short_date(m: re.Match) -> str:
-        d, mo = int(m.group(1)), int(m.group(2))
-        if 1 <= d <= 31 and 1 <= mo <= 12:
-            return f'{d} tháng {mo}'
-        return m.group(0)
+    # 3. Ngày tháng năm (đầy đủ trước, ngắn sau)
+    text = _normalize_standalone_year(text)
+    text = _normalize_full_date(text)
+    text = _normalize_month_ref(text)
+    text = _normalize_lunar(text)
+    text = _normalize_ordinal_day(text)
+    text = _normalize_short_date(text)
 
-    text = re.sub(r'\b(\d{1,2})/(\d{1,2})\b', _replace_short_date, text)
+    # 3b. Giờ giấc, dải số, mã số có số 0 đứng đầu
+    text = _normalize_time(text)
+    text = _normalize_ranges(text)
+    text = _normalize_leading_zeros(text)
 
-    for pattern, repl in _ABBR_MAP.items():
-        text = re.sub(pattern, repl, text)
+    # 4. Viết tắt (trước khi đọc số để "TP.HCM" không bị cắt thành "TP.")
+    for pattern, repl in _ABBR_MAP:
+        text = pattern.sub(repl, text)
+    for pattern, repl in _ABBR_TAIL:
+        text = pattern.sub(repl, text)
+    for pattern, repl in _LOANWORD_MAP:
+        text = pattern.sub(repl, text)
 
-    # Strip remaining markdown inline characters so TTS never reads them aloud
-    text = re.sub(r'[*_~#>]+', ' ', text)
+    # 5. Từ tiếng Anh / địa danh / tên riêng phổ biến -> phiên âm Việt hoá
+    for pattern, repl in _EN_WORD_RE:
+        text = pattern.sub(repl, text)
+
+    # 6. Giờ giấc, khoảng số, mã số (trước đo lường & số đứng riêng)
+    text = _normalize_clock(text)
+    text = _normalize_digit_code(text)
+    text = _normalize_number_range(text)
+
+    # 7. Đơn vị & đo lường
+    text = _normalize_measurements(text)
+
+    # 8. Số còn lại -> chữ
+    text = _normalize_standalone_numbers(text)
+
+    # 9. Dọn markdown/XML còn sót để TTS không đọc ký tự lạ
+    text = re.sub(r'[*_~#><|]+', ' ', text)
     text = re.sub(r'\[(?:\d+|footnote|chú thích)\]', '', text, flags=re.IGNORECASE)
     text = re.sub(r'https?://\S+', '', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -262,7 +805,7 @@ def _split_long_sentence(sentence: str, max_chars: int) -> list[str]:
     return final_parts
 
 
-def markdown_to_segments(markdown: str, max_chars: int = 280) -> list[AudioSegmentSpec]:
+def markdown_to_segments(markdown: str, max_chars: int = 500) -> list[AudioSegmentSpec]:
     segments: list[AudioSegmentSpec] = []
     raw_blocks = [b.strip() for b in re.split(r'\n\s*\n', markdown.strip()) if b.strip()]
 
@@ -294,6 +837,9 @@ def markdown_to_segments(markdown: str, max_chars: int = 280) -> list[AudioSegme
             chunked.extend(_split_long_sentence(s, max_chars=max_chars))
 
         for idx, chunk in enumerate(chunked):
+            chunk = chunk.strip()
+            if not re.search(r'\w', chunk):
+                continue
             is_last_in_para = idx == len(chunked) - 1
             pause = 800 if is_last_in_para else 400
             segments.append(AudioSegmentSpec(text=chunk, pause_after_ms=pause, is_chapter_title=False))
