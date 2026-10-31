@@ -3,12 +3,13 @@ import logging
 import os
 import re
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 import gradio as gr
 from core.abs_client import ABSClient, load_env_file
 from core import llm_normalizer
 from core.epub_parser import export_book_markdown, parse_book_markdown, parse_epub
-from core.m4b_packager import export_webvtt, package_m4b
+from core.m4b_packager import encode_wav_to_m4a, export_webvtt, package_m4b
 from core.models import BookMetadata, Chapter
 from core.text_normalizer import detect_uncertain_spans, normalize_vi_text
 from core.tts_engine import (
@@ -728,12 +729,36 @@ def handle_generate_m4b(
     chaps_out_dir = book_dir / 'chapters_audio'
     results: list[ChapterAudioResult] = []
     total = len(chapters)
-    for idx, ch in enumerate(chapters, start=1):
-        progress((idx - 1) / max(1, total), desc=f'Đang tổng hợp ({idx}/{total}): {ch.title}')
-        logger.info(f'⏳ [{idx}/{total}] Đang xử lý: "{ch.title}" ...')
-        res = render_chapter(ch, engine, chaps_out_dir, force=bool(force_rerender))
-        results.append(res)
-        logger.info(f'✔️ [{idx}/{total}] Xong "{ch.title}" ({res.duration_ms / 1000:.1f}s, {len(res.cues)} cues)')
+
+    # Pipeline: encode AAC ở thread riêng, chạy song song với GPU render.
+    # Chương xong trước được nén ngay trong lúc GPU render chương tiếp theo, và
+    # package_m4b sau đó chỉ cần stream copy (-c:a copy).
+    max_workers = max(1, min(4, (os.cpu_count() or 2) // 2))
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='aac')
+    encode_futures: list[tuple[int, Future]] = []
+    try:
+        for idx, ch in enumerate(chapters, start=1):
+            progress((idx - 1) / max(1, total), desc=f'Đang tổng hợp ({idx}/{total}): {ch.title}')
+            logger.info(f'⏳ [{idx}/{total}] Đang xử lý: "{ch.title}" ...')
+            res = render_chapter(ch, engine, chaps_out_dir, force=bool(force_rerender))
+            results.append(res)
+            logger.info(f'✔️ [{idx}/{total}] Xong "{ch.title}" ({res.duration_ms / 1000:.1f}s, {len(res.cues)} cues)')
+            # Submit ngay: encode chạy ngầm song song lần render kế tiếp.
+            encode_futures.append(
+                (idx, executor.submit(encode_wav_to_m4a, res.audio_path))
+            )
+
+        # Chờ toàn bộ encode còn lại rồi mới đóng gói.
+        for idx, fut in encode_futures:
+            try:
+                fut.result()
+            except Exception as exc:
+                logger.warning(
+                    f'⚠️ [AAC] Không encode được chương {idx:03d} '
+                    f'({exc}); sẽ fallback re-encode khi đóng gói.'
+                )
+    finally:
+        executor.shutdown(wait=True)
 
     progress(0.95, desc='Đang đóng gói .M4B & .VTT bằng FFmpeg...')
     logger.info('📦 [PACKAGING] Đang đóng gói .M4B và .VTT bằng FFmpeg...')

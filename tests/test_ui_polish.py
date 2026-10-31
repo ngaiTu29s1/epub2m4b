@@ -486,3 +486,164 @@ def test_ai_resolve_button_is_wired():
     assert 'ai_resolve_btn' in src
     assert 'fn=ai_resolve_uncertainty' in src
     assert '🤖 AI gợi ý phát âm (LLM)' in src
+
+
+# ---------------------------------------------------------------------------
+# Pipelined AAC: encode submit ngay sau mỗi chương, chạy song song với render
+# ---------------------------------------------------------------------------
+def test_generate_m4b_submits_aac_encode_per_chapter(tmp_path: Path, monkeypatch):
+    import wave, threading
+
+    class DummyEngine:
+        def synthesize_segment(self, text, out_wav):
+            sr = 24000
+            with wave.open(str(out_wav), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(b'\x00\x00' * (sr // 4))
+            return 250
+
+    monkeypatch.setattr(app, '_create_tts_engine', lambda *a, **kw: DummyEngine())
+    monkeypatch.setattr(app, 'package_m4b', lambda meta, results, out: out)
+    monkeypatch.setattr(app, 'export_webvtt', lambda results, out: out)
+
+    encoded, render_done = [], []
+
+    def fake_encode(wav_path, *a, **kw):
+        encoded.append(Path(wav_path).name)
+        return Path(wav_path).with_suffix('.m4a')
+
+    monkeypatch.setattr(app, 'encode_wav_to_m4a', fake_encode)
+
+    real_render = app.render_chapter
+
+    def spy_render(ch, engine, out_dir, force=False):
+        res = real_render(ch, engine, out_dir, force=force)
+        render_done.append(ch.index)
+        return res
+
+    monkeypatch.setattr(app, 'render_chapter', spy_render)
+
+    state = {'book_dir': str(tmp_path / 'book')}
+    app.handle_generate_m4b(
+        state=state,
+        book_title='Sách Pipeline',
+        book_author='Tác Giả',
+        md_text='# Chương 1\nNội dung một.\n# Chương 2\nNội dung hai.',
+        engine_choice='VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)',
+        voice_choice='Hải Đăng',
+        rate_pct=0,
+        clone_ref_audio=None,
+        clone_ref_text='',
+        force_rerender=True,
+    )
+
+    assert len(render_done) == 2
+    assert len(encoded) == 2, f'phải encode mỗi chương 1 lần, nhận {encoded}'
+    assert all(n.endswith('.wav') for n in encoded)
+
+
+def test_generate_m4b_encode_runs_while_render_continues(tmp_path: Path, monkeypatch):
+    """Encode chương N phải chạy ngầm, không chặn render chương N+1."""
+    import wave, threading
+
+    class DummyEngine:
+        def synthesize_segment(self, text, out_wav):
+            sr = 24000
+            with wave.open(str(out_wav), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(b'\x00\x00' * (sr // 4))
+            return 250
+
+    monkeypatch.setattr(app, '_create_tts_engine', lambda *a, **kw: DummyEngine())
+    monkeypatch.setattr(app, 'package_m4b', lambda meta, results, out: out)
+    monkeypatch.setattr(app, 'export_webvtt', lambda results, out: out)
+
+    events = []
+    encode_threads = []
+
+    def fake_encode(wav_path, *a, **kw):
+        encode_threads.append(threading.current_thread().name)
+        events.append(('encode_start', Path(wav_path).stem))
+        return Path(wav_path).with_suffix('.m4a')
+
+    monkeypatch.setattr(app, 'encode_wav_to_m4a', fake_encode)
+
+    real_render = app.render_chapter
+
+    def spy_render(ch, engine, out_dir, force=False):
+        events.append(('render_start', ch.index))
+        return real_render(ch, engine, out_dir, force=force)
+
+    monkeypatch.setattr(app, 'render_chapter', spy_render)
+
+    state = {'book_dir': str(tmp_path / 'book')}
+    app.handle_generate_m4b(
+        state=state,
+        book_title='Sách Song Song',
+        book_author='Tác Giả',
+        md_text='# Chương 1\nMột.\n# Chương 2\nHai.\n# Chương 3\nBa.',
+        engine_choice='VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)',
+        voice_choice='Hải Đăng',
+        rate_pct=0,
+        clone_ref_audio=None,
+        clone_ref_text='',
+        force_rerender=True,
+    )
+
+    # Encode chạy trên thread riêng của executor, không phải thread chính.
+    assert encode_threads, 'encode không được gọi'
+    main = threading.main_thread().name
+    assert all(t != main for t in encode_threads), encode_threads
+    # Chương 1 encode phải được submit trước khi chương 3 render xong.
+    idx_c1_encode = events.index(('encode_start', 'chapter_001'))
+    idx_c3_render = events.index(('render_start', 3))
+    assert idx_c1_encode < idx_c3_render
+
+
+def test_generate_m4b_survives_encode_failure(tmp_path: Path, monkeypatch):
+    """Encode lỗi không được làm hỏng đóng gói (fallback re-encode)."""
+    import wave
+
+    class DummyEngine:
+        def synthesize_segment(self, text, out_wav):
+            sr = 24000
+            with wave.open(str(out_wav), 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sr)
+                wf.writeframes(b'\x00\x00' * (sr // 4))
+            return 250
+
+    monkeypatch.setattr(app, '_create_tts_engine', lambda *a, **kw: DummyEngine())
+    monkeypatch.setattr(app, 'export_webvtt', lambda results, out: out)
+
+    packaged = {}
+
+    def fake_package(meta, results, out):
+        packaged['n'] = len(results)
+        return out
+
+    monkeypatch.setattr(app, 'package_m4b', fake_package)
+    monkeypatch.setattr(
+        app, 'encode_wav_to_m4a',
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('ffmpeg boom')),
+    )
+
+    state = {'book_dir': str(tmp_path / 'book')}
+    app.handle_generate_m4b(
+        state=state,
+        book_title='Sách Lỗi Encode',
+        book_author='Tác Giả',
+        md_text='# Chương 1\nNội dung.',
+        engine_choice='VieNeu-TTS v3 Turbo (Mặc định — chất lượng cao)',
+        voice_choice='Hải Đăng',
+        rate_pct=0,
+        clone_ref_audio=None,
+        clone_ref_text='',
+        force_rerender=True,
+    )
+    assert packaged['n'] == 1, 'vẫn phải đóng gói dù encode lỗi'

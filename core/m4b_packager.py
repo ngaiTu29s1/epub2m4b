@@ -77,6 +77,68 @@ def export_webvtt(chapters: list[ChapterAudioResult], out_vtt: Path) -> Path:
     return out_vtt
 
 
+def encode_wav_to_m4a(
+    wav_path: Path,
+    out_m4a: Path | None = None,
+    force: bool = False,
+    bitrate: str = '64k',
+) -> Path:
+    """Nén một file WAV thành M4A/AAC (tách khỏi bước đóng gói).
+
+    Tách riêng để chạy song song với vòng render GPU. Kết quả được cache: file
+    đích còn mới hơn WAV và có dữ liệu thì bỏ qua encode.
+    """
+    wav_path = Path(wav_path)
+    out_m4a = Path(out_m4a) if out_m4a else wav_path.with_suffix('.m4a')
+
+    if (
+        not force
+        and out_m4a.exists()
+        and out_m4a.stat().st_size > 0
+        and out_m4a.stat().st_mtime >= wav_path.stat().st_mtime
+    ):
+        logger.info(f'⚡ [AAC CACHE] Đã có {out_m4a.name}, bỏ qua encode.')
+        return out_m4a
+
+    out_m4a.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        _get_ffmpeg_bin(), '-y', '-v', 'error',
+        '-i', str(wav_path),
+        '-c:a', 'aac', '-b:a', bitrate, '-ac', '1',
+        '-movflags', '+faststart',
+        str(out_m4a),
+    ]
+    logger.info(f'🎧 [AAC] Encode {wav_path.name} → {out_m4a.name} ({bitrate})...')
+    subprocess.run(cmd, check=True)
+    return out_m4a
+
+
+def _m4a_for(ch: ChapterAudioResult) -> Path | None:
+    """File .m4a đã encode sẵn cho chương, nếu có và hợp lệ (size > 0)."""
+    audio = Path(ch.audio_path)
+    candidate = audio if audio.suffix.lower() == '.m4a' else audio.with_suffix('.m4a')
+    if candidate.exists() and candidate.stat().st_size > 0:
+        return candidate
+    return None
+
+
+def resolve_package_sources(
+    chapters: list[ChapterAudioResult],
+) -> tuple[list[Path], bool]:
+    """Chọn nguồn cho bước đóng gói.
+
+    Trả ``(danh_sách_file, dùng_stream_copy)``. Stream copy chỉ khi **mọi**
+    chương đều có .m4a sẵn — trộn WAV và M4A trong một lệnh concat sẽ vỡ.
+    """
+    sources: list[Path] = []
+    for ch in chapters:
+        m4a = _m4a_for(ch)
+        if m4a is None:
+            return [Path(c.audio_path) for c in chapters], False
+        sources.append(m4a)
+    return sources, True
+
+
 def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b: Path) -> Path:
     if not chapters:
         raise ValueError('Cần ít nhất 1 chương để đóng gói M4B.')
@@ -85,12 +147,24 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
     ffmpeg_bin = _get_ffmpeg_bin()
     logger.info(f'🎬 [FFMPEG] Bắt đầu ghép {len(chapters)} chương vào file {out_m4b.name}...')
 
+    sources, stream_copy = resolve_package_sources(chapters)
+    if stream_copy:
+        logger.info(
+            f'⚡ [PIPELINE] Phát hiện đủ {len(sources)} file .m4a — dùng stream copy '
+            f'(-c:a copy), bỏ qua re-encode AAC.'
+        )
+    else:
+        logger.info('🎙️ [PIPELINE] Thiếu .m4a cho một số chương — fallback về WAV + encode AAC.')
+
+    # Nhãn chương theo thời lượng WAV gốc (không đổi giữa 2 chế độ).
+    concat_sources = sources
+
     with tempfile.TemporaryDirectory() as tmpd:
         tmp_dir = Path(tmpd)
         concat_file = tmp_dir / 'concat.txt'
         concat_lines = []
-        for ch in chapters:
-            safe_path = str(Path(ch.audio_path).resolve()).replace("'", "'\\''")
+        for src in concat_sources:
+            safe_path = str(Path(src).resolve()).replace("'", "'\\''")
             concat_lines.append(f"file '{safe_path}'")
         concat_file.write_text('\n'.join(concat_lines) + '\n', encoding='utf-8')
 
@@ -103,6 +177,11 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
             '-f', 'concat', '-safe', '0', '-i', str(concat_file),
             '-f', 'ffmetadata', '-i', str(ffmeta_file),
         ]
+        audio_args = (
+            ['-c:a', 'copy']
+            if stream_copy
+            else ['-c:a', 'aac', '-b:a', '64k', '-ac', '1']
+        )
         if has_cover:
             cmd.extend(['-i', str(Path(meta.cover_path).resolve())])
             cmd.extend([
@@ -110,7 +189,7 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
                 '-map', '2:v',
                 '-map_metadata', '1',
                 '-map_chapters', '1',
-                '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
+                *audio_args,
                 '-c:v', 'copy',
                 '-disposition:v:0', 'attached_pic',
             ])
@@ -119,7 +198,7 @@ def package_m4b(meta: BookMetadata, chapters: list[ChapterAudioResult], out_m4b:
                 '-map', '0:a',
                 '-map_metadata', '1',
                 '-map_chapters', '1',
-                '-c:a', 'aac', '-b:a', '64k', '-ac', '1',
+                *audio_args,
             ])
         cmd.extend(['-movflags', '+faststart', str(out_m4b)])
         subprocess.run(cmd, check=True)
