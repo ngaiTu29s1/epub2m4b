@@ -122,13 +122,14 @@ def normalize_text(text: str, language: str = "vi") -> str:
     return text
 
 
-def _split_text_to_sentences(text: str, max_words: int = 20) -> List[str]:
+def _split_text_to_sentences(text: str, max_words: int = 30) -> List[str]:
     """Split text into sentences by punctuation marks.
 
-    Long multi-clause sentences (>= 18 words containing a comma) are further
-    split on ``,`` / ``;`` / ``–—`` so T3 does not accelerate and slur the tail
-    of a 50-65 word sentence. Every emitted chunk is terminated with a full
-    stop so T3 lands a natural falling intonation.
+    Only sentences of at least 30 words that contain a comma are further split
+    on ``,`` / ``;`` / ``–—``; each emitted clause preserves the original
+    punctuation (a comma clause ends with a real ``,``, never a forced ``.``).
+    Splitting always happens *at* a punctuation boundary — never in the middle
+    of a word — so T3 is never handed an unpunctuated fragment to break.
     """
     # Split by . ? ! and keep the delimiter
     pattern = r'([.?!]+)'
@@ -155,9 +156,10 @@ def _split_text_to_sentences(text: str, max_words: int = 20) -> List[str]:
     # Second pass: break long comma-clause sentences into short clauses.
     chunked: List[str] = []
     for sentence in sentences:
-        if len(sentence.split()) < 18 or ',' not in sentence:
+        if len(sentence.split()) < 30 or ',' not in sentence:
             chunked.append(sentence)
             continue
+        # Split keeping the separating punctuation on the left piece.
         pieces = re.split(r'(?<=[,;–—])\s+', sentence)
         current_clause = ""
         for piece in pieces:
@@ -167,16 +169,14 @@ def _split_text_to_sentences(text: str, max_words: int = 20) -> List[str]:
             if current_clause and len(current_clause.split()) + len(piece.split()) > max_words:
                 chunked.append(current_clause)
                 current_clause = piece
+            elif not current_clause:
+                current_clause = piece
             else:
-                current_clause = f'{current_clause} {piece}'.strip()
+                current_clause = f'{current_clause} {piece}'
         if current_clause:
             chunked.append(current_clause)
 
-    return [
-        c if c.endswith(('.', '!', '?', '…')) else f'{c}.'
-        for c in (chunked or sentences)
-        if c.strip()
-    ]
+    return [c for c in (chunked or sentences) if c.strip()]
 
 
 def trim_silence(audio: np.ndarray, sr: int, top_db: int = 30) -> np.ndarray:
@@ -323,6 +323,177 @@ def apply_fade_in(audio: np.ndarray, sr: int, fade_duration: float = 0.005) -> n
     audio_copy[:fade_samples] = audio_copy[:fade_samples] * fade_curve
     
     return audio_copy
+
+
+def _frame_rms_zcr(
+    audio: np.ndarray,
+    sr: int,
+    frame_ms: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split ``audio`` into ``frame_ms`` frames and return per-frame (RMS, ZCR).
+
+    RMS is the root-mean-square amplitude, ZCR the zero-crossing rate
+    (crossings / (frame_len - 1)). Frames are non-overlapping (hop == frame).
+    """
+    frame_len = max(1, int(sr * frame_ms / 1000.0))
+    n_frames = len(audio) // frame_len
+    if n_frames == 0:
+        rms = np.array([float(np.sqrt(np.mean(audio ** 2)))]) if len(audio) else np.array([])
+        zcr = np.array([0.0])
+        return rms, zcr
+
+    frames = audio[: n_frames * frame_len].reshape(n_frames, frame_len)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1))
+    signs = frames >= 0
+    crossings = np.count_nonzero(signs[:, 1:] != signs[:, :-1], axis=1)
+    zcr = crossings.astype(np.float64) / max(1, frame_len - 1)
+    return rms, zcr
+
+
+def tail_cleanup_clean(
+    audio: np.ndarray,
+    sr: int,
+    frame_ms: float = 10.0,
+    body_rms: float = 0.02,
+    valley_rms: float = 0.0055,
+    valley_frames: int = 3,
+    search_tail_s: float = 0.6,
+    zcr_noise: float = 0.12,
+    zcr_rms: float = 0.04,
+    fade_in_ms: float = 10.0,
+    fade_out_ms: float = 25.0,
+    head_keep_ms: float = 18.0,
+) -> np.ndarray:
+    """Cut the buzzing tail artifact *and* the redundant head silence.
+
+    S3Gen's final buffers contain, after the real speech has decayed to a
+    silence valley (RMS < ``valley_rms``), a short high-ZCR noise island
+    (RMS up to ~0.036, ZCR 0.15-0.36) that is heard as a "rè rè"/buzz. A
+    right-to-left trim cannot remove it because the noise island itself stops
+    the trim. This routine instead scans the last ``search_tail_s`` seconds
+    left-to-right: once the speech body (RMS > ``body_rms``) has been seen and
+    the signal then drops into a valley lasting >= ``valley_frames`` frames
+    (30 ms), everything from the *start of that valley* onward is discarded —
+    the valley **and** every trailing noise island after it.
+
+    Independently, the leading silence S3Gen pads onto every buffer is trimmed
+    down to at most ``head_keep_ms`` before the first speech frame. Without
+    this, concatenating clauses accumulates ~150-200 ms of dead air on top of
+    the programmed pause. A Hann fade-in (``fade_in_ms``) then ramps the kept
+    head up cleanly.
+
+    Any residual weak/high-ZCR frames at the very end are dropped too, then a
+    Hann fade-out (``fade_out_ms``) drives the amplitude to exactly 0.0 so the
+    buffer joins a pause without a click.
+
+    Returns a new array (never longer than the input).
+    """
+    audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+    n = len(audio)
+    if n == 0:
+        return audio
+
+    frame_len = max(1, int(sr * frame_ms / 1000.0))
+    rms, zcr = _frame_rms_zcr(audio, sr, frame_ms)
+    n_frames = len(rms)
+    if n_frames == 0:
+        return _apply_hann_fades(audio, sr, fade_in_ms, fade_out_ms)
+
+    # Only inspect the trailing window where the artifact lives.
+    tail_frames = min(n_frames, max(1, int(search_tail_s * 1000.0 / frame_ms)))
+    start_frame = n_frames - tail_frames
+
+    cut_frame = n_frames  # exclusive end frame kept
+    seen_body = False
+    valley_run = 0
+    for f in range(start_frame, n_frames):
+        r = rms[f]
+        if r > body_rms:
+            seen_body = True
+            valley_run = 0
+            continue
+        if seen_body and r < valley_rms:
+            if valley_run == 0:
+                # Mark the start of the valley; if it lasts long enough we cut here.
+                valley_start = f
+            valley_run += 1
+            if valley_run >= valley_frames:
+                cut_frame = valley_start
+                break
+        elif r >= valley_rms:
+            # Anything at/above valley level (including a noise island) breaks
+            # a forming valley only if it is a real speech body; weak high-ZCR
+            # islands must not reset the valley counter.
+            if r > body_rms:
+                valley_run = 0
+            else:
+                valley_run = max(0, valley_run)
+
+    # Trim trailing weak/high-ZCR noise frames that survived the valley cut.
+    last = cut_frame
+    while last > 1:
+        r = rms[last - 1]
+        z = zcr[last - 1]
+        if r < zcr_rms and z > zcr_noise:
+            last -= 1
+        else:
+            break
+    cut_frame = last
+
+    keep_frames = min(cut_frame, n_frames)
+    end = min(n, keep_frames * frame_len)
+    cleaned = audio[:end]
+    if len(cleaned) == 0:
+        return audio[:0]
+
+    # Trim redundant leading silence S3Gen pads onto every buffer: keep at most
+    # ``head_keep_ms`` before the first speech frame so concatenated clauses do
+    # not accumulate dead air on top of the programmed pause.
+    head_frames = min(n_frames, max(1, int(head_keep_ms * 1000.0 / frame_ms)))
+    first_speech = None
+    scan_frames = min(n_frames, max(head_frames, int(0.5 * 1000.0 / frame_ms)))
+    for f in range(scan_frames):
+        if rms[f] > body_rms:
+            first_speech = f
+            break
+    if first_speech is not None and first_speech > 0:
+        head_samples = max(0, first_speech - head_frames) * frame_len
+        cleaned = cleaned[head_samples:]
+    if len(cleaned) == 0:
+        return audio[:0]
+
+    return _apply_hann_fades(cleaned, sr, fade_in_ms, fade_out_ms)
+
+
+def _apply_hann_fades(
+    audio: np.ndarray, sr: int, fade_in_ms: float, fade_out_ms: float
+) -> np.ndarray:
+    """Apply a raised-cosine fade-in/out so the buffer starts and ends at 0.0.
+
+    The fade-out uses a *squared* raised-cosine: it rolls off faster near the
+    end, so the final ~5 ms is already effectively silent (guaranteeing the
+    clause joins the following pause without any residual buzz).
+    """
+    out = audio.copy()
+    n = len(out)
+    if n == 0:
+        return out
+
+    fin = min(int(sr * fade_in_ms / 1000.0), n)
+    if fin > 1:
+        out[:fin] *= np.hanning(fin * 2)[:fin]
+
+    fout = min(int(sr * fade_out_ms / 1000.0), n)
+    if fout > 1:
+        curve = np.hanning(fout * 2)[fout:]  # 1 -> 0 raised cosine
+        out[-fout:] *= curve ** 2  # faster roll-off near the end
+
+    # Hard-zero the last 1 ms to guarantee a dead-silent edge into the pause.
+    z = min(int(sr * 0.001), n)
+    if z:
+        out[-z:] = 0.0
+    out[-1] = 0.0
+    return out
 
 
 def crossfade_concat(audios: List[np.ndarray], sr: int, fade_ms: int = 50, pause_ms: int = 500) -> np.ndarray:
@@ -660,10 +831,11 @@ class Viterbox:
             speech_tokens = speech_tokens[0]
             speech_tokens = drop_invalid_tokens(speech_tokens)
             
-            # FIX (Root Cause): Remove the last token which often contains noise/transients
-            # causing click artifacts in S3 generation.
-            if len(speech_tokens) > 1:
-                speech_tokens = speech_tokens[:-1]
+            # FIX (Root Cause): Remove the last TWO tokens, not just one. The
+            # final 1-2 T3 speech tokens decode to a high-ZCR buzzing burst that
+            # S3Gen renders as an audible "rè rè" tail right before each pause.
+            if len(speech_tokens) > 3:
+                speech_tokens = speech_tokens[:-2]
                 
             speech_tokens = speech_tokens.to(self.device)
         
@@ -758,7 +930,11 @@ class Viterbox:
                 # Keep a generous margin so short titles ("Phần dẫn.") do not
                 # lose their falling tail to an aggressive VAD endpoint.
                 audio_np = vad_trim(audio_np, self.sr, margin_s=cond_margin_s)
-                
+
+                # Remove the buzzing S3Gen tail artifact (high-ZCR noise island
+                # after the silence valley) and fade to exactly 0.0.
+                audio_np = tail_cleanup_clean(audio_np, self.sr)
+
                 # Apply fade-out to prevent click at end of each segment
                 audio_np = apply_fade_out(audio_np, self.sr, fade_duration=0.01)  # 10ms fade-out
                 
@@ -788,6 +964,10 @@ class Viterbox:
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
             )
+            # Remove the buzzing tail artifact S3Gen leaves after the real
+            # speech decays to silence, then fade to exactly 0.0 so the clause
+            # joins the following pause click-free.
+            audio_np = tail_cleanup_clean(audio_np, self.sr)
             return torch.from_numpy(audio_np).unsqueeze(0)
     
     def save_audio(self, audio: torch.Tensor, path: Union[str, Path], trim_silence: bool = True):

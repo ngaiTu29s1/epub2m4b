@@ -112,12 +112,19 @@ def normalize_viterbox_text(text: str) -> str:
 
 # Clause chunking: a T3-run on a 50-65 word sentence with many comma clauses
 # accelerates and slurs words toward the end. Splitting on comma/semicolon/dash
-# into 8-20 word clauses (each terminated with a full stop) makes T3 reset its
-# prosody at every clause, so every word is articulated cleanly.
+# into short clauses makes T3 reset its prosody at every clause, so every word
+# is articulated cleanly. Crucially the separator is *kept* in the emitted text
+# so T3 still sees the real comma/pause hierarchy.
 _MAX_CLAUSE_WORDS = 20
-_MIN_SENTENCE_WORDS_TO_SPLIT = 18
-_PAUSE_CLAUSE_MS = 250   # after a comma/semicolon clause
-_PAUSE_SENTENCE_MS = 500  # after a full stop
+# Sentences shorter than this stay whole: an 18-21 word sentence with clear
+# commas reads fluently in one T3 run, so we must NOT shred it into fragments.
+_MIN_SENTENCE_WORDS_TO_SPLIT = 30
+_PAUSE_CLAUSE_MS = 200   # after a comma/semicolon clause (~a real comma breath)
+_PAUSE_SENTENCE_MS = 480  # after a full stop
+# Tiny 1-3 word clauses get folded into their neighbour (slack on the max) so a
+# short "nếu ly hôn," never floats alone and never swallows its comma.
+_TINY_CLAUSE_WORDS = 3
+_CHUNK_SLACK_WORDS = 4
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -129,9 +136,11 @@ def _split_sentences(text: str) -> list[str]:
 def _clause_pieces(sentence: str) -> list[tuple[str, bool]]:
     """Split ``sentence`` on ``,``/``;``/``–—`` into ``(text, ends_with_comma)``.
 
-    The separator is dropped from the returned text; ``ends_with_comma`` records
-    whether the source clause ended with a comma (short breath) versus a full
-    stop or end-of-string.
+    The separator is **kept at the end of ``text``** (a comma stays a comma) so
+    that when clauses are re-joined, no comma is ever silently dropped; and T3
+    still sees the punctuation it needs to place a real comma breath.
+    ``ends_with_comma`` records whether the source clause ended with a comma /
+    semicolon / dash (short breath) versus a full stop or end-of-string.
     """
     pieces: list[tuple[str, bool]] = []
     buf: list[str] = []
@@ -141,7 +150,7 @@ def _clause_pieces(sentence: str) -> list[tuple[str, bool]]:
         if ch in ',;–—':
             text = ''.join(buf).strip()
             if text:
-                pieces.append((text, True))
+                pieces.append((f'{text}{ch}', True))
             buf = []
         else:
             buf.append(ch)
@@ -152,6 +161,25 @@ def _clause_pieces(sentence: str) -> list[tuple[str, bool]]:
     return pieces
 
 
+def _join_pieces(left: str, right: str) -> str:
+    """Join two clause fragments, preserving the boundary comma if present.
+
+    ``left`` may already end with a comma/semicolon/dash; in that case keep it
+    and join with a space. Otherwise join with a plain space.
+    """
+    left = left.rstrip()
+    right = right.strip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return f'{left} {right}'
+
+
+def _ends_with_any(text: str, chars: str) -> bool:
+    return bool(text) and text[-1] in chars
+
+
 def _chunk_with_pauses(text: str) -> list[tuple[str, int]]:
     """Core clause chunker returning ``(clause_text, pause_after_ms)`` pairs.
 
@@ -159,7 +187,8 @@ def _chunk_with_pauses(text: str) -> list[tuple[str, int]]:
     through whole (pause = full stop). Longer sentences are split on
     ``,``/``;``/``–—`` into clauses of <= :data:`_MAX_CLAUSE_WORDS` words; a
     clause that came from a comma boundary takes the short breath pause, while
-    the trailing clause takes the full stop pause.
+    the trailing clause takes the full stop pause. The original punctuation is
+    preserved verbatim.
     """
     planned: list[tuple[str, int]] = []
     for sentence in _split_sentences(text):
@@ -167,11 +196,18 @@ def _chunk_with_pauses(text: str) -> list[tuple[str, int]]:
             planned.append((sentence, _PAUSE_SENTENCE_MS))
             continue
 
+        pieces = _clause_pieces(sentence)
         current = ''
         pending_comma = False
-        for piece, ends_comma in _clause_pieces(sentence):
+        for piece, ends_comma in pieces:
             n_words = len(piece.split())
             if current and len(current.split()) + n_words > _MAX_CLAUSE_WORDS:
+                # Never orphan a tiny following clause: allow slight overshoot.
+                if n_words <= _TINY_CLAUSE_WORDS and \
+                        len(current.split()) + n_words <= _MAX_CLAUSE_WORDS + _CHUNK_SLACK_WORDS:
+                    current = _join_pieces(current, piece)
+                    pending_comma = ends_comma
+                    continue
                 planned.append((current, _PAUSE_CLAUSE_MS if pending_comma else _PAUSE_SENTENCE_MS))
                 current = piece
                 pending_comma = ends_comma
@@ -179,14 +215,14 @@ def _chunk_with_pauses(text: str) -> list[tuple[str, int]]:
                 current = piece
                 pending_comma = ends_comma
             else:
-                current = f'{current} {piece}'
+                current = _join_pieces(current, piece)
                 pending_comma = ends_comma
         if current:
             # The final clause of a sentence always lands a full stop.
             planned.append((current, _PAUSE_SENTENCE_MS))
 
     return [
-        (c if c.endswith(('.', '!', '?', '…')) else f'{c}.', pause)
+        (c, pause)
         for c, pause in planned
         if c.strip()
     ]
@@ -197,8 +233,9 @@ def chunk_into_clauses(text: str) -> list[str]:
 
     Sentences of fewer than :data:`_MIN_SENTENCE_WORDS_TO_SPLIT` words are kept
     intact. Longer ones are split on ``,``/``;``/``–—`` and greedily re-joined
-    so each clause holds at most :data:`_MAX_CLAUSE_WORDS` words, then each
-    clause is terminated with a full stop so T3 drops its pitch naturally.
+    so each clause holds at most :data:`_MAX_CLAUSE_WORDS` words. Punctuation is
+    preserved verbatim, so a comma clause ends with a real ``,`` (never a forced
+    ``.``), letting T3 place a short comma breath rather than a full stop.
     """
     return [clause for clause, _pause in _chunk_with_pauses(text)]
 

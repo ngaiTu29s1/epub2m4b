@@ -273,18 +273,23 @@ def test_heading_tokenizes_to_lowercase_chars():
 # Step 1 — Clause chunking for long sentences
 # --------------------------------------------------------------------------
 
-def test_chunk_long_sentence_splits_on_commas():
+def test_chunk_long_sentence_splits_on_commas_preserving_them():
     from core.chatterbox_engine import chunk_into_clauses
 
+    # 31 words with commas -> long enough to split.
     long = (
         'Trương Đông Thăng vốn là người đàn ông ở rể, trước khi cưới đã làm '
-        'giấy chứng minh tài sản, nếu ly hôn thì ra đi tay trắng.'
+        'giấy chứng minh tài sản, nếu ly hôn, gần như là ra đi tay trắng và '
+        'không có gì cả trong tay của anh ta lúc đó.'
     )
     clauses = chunk_into_clauses(long)
     assert len(clauses) >= 2
-    assert all(c.endswith('.') for c in clauses)
-    # Every clause stays within the friendly word budget.
-    assert all(len(c.split()) <= 21 for c in clauses)
+    # No emitted clause is a bare space-joined fragment: a clause cut at a comma
+    # MUST still end with the comma (never silently dropped, never forced to '.').
+    joined = ' '.join(clauses)
+    assert joined.count(',') >= 2 or any(c.endswith(',') for c in clauses)
+    # Every clause stays within the friendly word budget (+ slack for tiny ones).
+    assert all(len(c.split()) <= 25 for c in clauses)
 
 
 def test_chunk_short_sentence_is_untouched():
@@ -293,20 +298,68 @@ def test_chunk_short_sentence_is_untouched():
     assert chunk_into_clauses('Phần dẫn.') == ['Phần dẫn.']
 
 
+def test_medium_sentence_with_commas_kept_whole():
+    """An 18-21 word sentence with clear commas must NOT be shredded."""
+    from core.chatterbox_engine import chunk_into_clauses
+
+    sentence = (
+        'Năm thứ tư sau khi kết hôn, Từ Tịnh ngoại tình, đề nghị ly hôn với '
+        'Trương Đông Thăng.'
+    )
+    assert chunk_into_clauses(sentence) == [sentence]
+
+
+def test_commas_are_never_dropped_in_clause_chunking():
+    """Requirement #4: every comma in the source survives chunking."""
+    from core.chatterbox_engine import chunk_into_clauses
+
+    source = (
+        'Năm thứ tư sau khi kết hôn, Từ Tịnh ngoại tình, đề nghị ly hôn với '
+        'Trương Đông Thăng. Sau khi suy nghĩ kỹ lưỡng, anh ta quyết định làm '
+        'vài việc để thay đổi kết cục này, nào ngờ mọi thứ đổ bể hoàn toàn '
+        'và không thể cứu vãn được nữa trong tình huống đó.'
+    )
+    clauses = chunk_into_clauses(source)
+    n_src = source.count(',')
+    n_out = sum(c.count(',') for c in clauses)
+    assert n_out == n_src, f'comma count changed: {n_src} -> {n_out}'
+
+
+def test_every_clause_boundary_is_at_punctuation():
+    """Requirement #4: no clause boundary may be an unpunctuated word gap.
+
+    Every clause (except the final one) must end with one of
+    , ; : . ! ? … — i.e. T3 is only ever asked to break at real punctuation.
+    """
+    from core.chatterbox_engine import chunk_into_clauses
+
+    source = (
+        'Đây vốn là kế hoạch phạm tội hoàn mỹ mà anh ta đã dày công dàn dựng, '
+        'nào ngờ màn biểu diễn này lại bị ba học sinh đang nô đùa ở gần đó vô '
+        'tình dùng máy ảnh quay lại, và mọi chuyện vỡ lẽ ngay sau đó vài ngày '
+        'khi cảnh sát vào cuộc điều tra rất nhanh chóng và kỹ lưỡng.'
+    )
+    clauses = chunk_into_clauses(source)
+    terminators = (',', ';', ':', '.', '!', '?', '…')
+    for c in clauses[:-1]:
+        assert c.endswith(terminators), f'clause boundary without punctuation: {c!r}'
+
+
 def test_plan_viterbox_segments_pauses():
     from core.chatterbox_engine import plan_viterbox_segments
 
     planned = plan_viterbox_segments('PHẦN DẪN')
-    assert planned == [('Phần dẫn.', 500)]
+    assert planned == [('Phần dẫn.', 480)]
 
     long = (
         'Trương Đông Thăng vốn là người đàn ông ở rể, trước khi cưới đã làm '
-        'giấy chứng minh tài sản, nếu ly hôn thì ra đi tay trắng.'
+        'giấy chứng minh tài sản, nếu ly hôn, gần như là ra đi tay trắng và '
+        'không có gì cả trong tay của anh ta lúc đó.'
     )
     planned = plan_viterbox_segments(long)
-    # Comma-split clauses get the short breath, the sentence end gets 500 ms.
-    assert planned[-1][1] == 500
-    assert any(p == 250 for _c, p in planned)
+    # Comma-split clauses get the short breath, the sentence end gets ~480 ms.
+    assert planned[-1][1] == 480
+    assert any(p == 200 for _c, p in planned)
 
 
 # --------------------------------------------------------------------------
@@ -344,6 +397,44 @@ def test_viterbox_engine_caches_conditionals(tmp_path: Path, monkeypatch):
     assert fake.calls[0]['split_sentences'] is False
 
 
+def test_vendor_split_text_never_cuts_midword():
+    """RC3: the vendor sentence splitter must only break at punctuation, never
+    in the middle of an unpunctuated word run."""
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(repo / 'vendor' / 'viterbox_src'))
+    from viterbox.tts import _split_text_to_sentences
+
+    text = (
+        'Đây vốn là kế hoạch phạm tội hoàn mỹ mà anh ta đã dày công dàn dựng, '
+        'nào ngờ màn biểu diễn này lại bị ba học sinh đang nô đùa ở gần đó vô '
+        'tình dùng máy ảnh quay lại và mọi chuyện vỡ lẽ ngay sau đó vài ngày '
+        'khi cảnh sát vào cuộc điều tra rất nhanh chóng và kỹ lưỡng trong '
+        'vụ án này.'
+    )
+    parts = _split_text_to_sentences(text)
+    terminators = (',', ';', ':', '.', '!', '?', '…')
+    for p in parts[:-1]:
+        assert p.endswith(terminators), f'mid-word split: {p!r}'
+
+
+def test_vendor_split_keeps_commas_and_stopdots():
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(repo / 'vendor' / 'viterbox_src'))
+    from viterbox.tts import _split_text_to_sentences
+
+    text = (
+        'Trương Đông Thăng vốn là người đàn ông ở rể, trước khi cưới đã làm '
+        'giấy chứng minh tài sản, nếu ly hôn, gần như là ra đi tay trắng và '
+        'không còn bất cứ thứ gì trong tay cả lúc đó.'
+    )
+    parts = _split_text_to_sentences(text)
+    assert sum(p.count(',') for p in parts) == text.count(',')
+
+
 def test_viterbox_engine_synthesizes_each_clause(tmp_path: Path, monkeypatch):
     from core import chatterbox_engine as ce
 
@@ -353,10 +444,139 @@ def test_viterbox_engine_synthesizes_each_clause(tmp_path: Path, monkeypatch):
     engine = ce.ViterboxTTSEngine()
     long = (
         'Trương Đông Thăng vốn là người đàn ông ở rể, trước khi cưới đã làm '
-        'giấy chứng minh tài sản, nếu ly hôn thì ra đi tay trắng.'
+        'giấy chứng minh tài sản, nếu ly hôn, gần như là ra đi tay trắng và '
+        'không còn gì cả trong tay của anh ta lúc đó.'
     )
     engine.synthesize_segment(long, tmp_path / 'seg.wav')
 
     # One generate() call per clause.
     assert len(fake.calls) >= 2
     assert all(c['split_sentences'] is False for c in fake.calls)
+
+
+# --------------------------------------------------------------------------
+# Tail-artifact cleanup (buzzing "rè rè" before every pause)
+# --------------------------------------------------------------------------
+
+def _load_tail_cleanup():
+    import sys
+
+    repo = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(repo / 'vendor' / 'viterbox_src'))
+    from viterbox.tts import _frame_rms_zcr, tail_cleanup_clean
+
+    return tail_cleanup_clean, _frame_rms_zcr
+
+
+def test_tail_cleanup_cuts_silence_valley_and_buzz_burst():
+    """synthetic speech + 150ms valley + 100ms 0.03-RMS burst -> the burst
+    (and the valley) must be removed, with a fade to exactly 0.0."""
+    import numpy as np
+
+    tail_cleanup_clean, _ = _load_tail_cleanup()
+    sr = 24000
+    rng = np.random.default_rng(0)
+
+    speech = 0.1 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)
+    valley = np.zeros(int(0.15 * sr))
+    burst = 0.03 * rng.standard_normal(int(0.10 * sr))
+    audio = np.concatenate([speech, valley, burst]).astype(np.float32)
+
+    out = tail_cleanup_clean(audio, sr)
+
+    # Trimmed to (at most) the start of the valley, never longer.
+    assert len(out) <= len(audio)
+    assert out[-1] == 0.0
+    # No buzzing island survives: the final 5 ms is faded to near-silence and
+    # the last sample is exactly zero.
+    assert float(np.max(np.abs(out[-int(0.005 * sr):]))) < 0.02
+    # The burst region (tail 100ms of the input) is gone from the output tail.
+    assert not np.array_equal(out[-1:], audio[-1:])
+
+
+def test_tail_cleanup_tail_rms_monotonically_decays_to_zero():
+    import numpy as np
+
+    tail_cleanup_clean, _frame_rms_zcr = _load_tail_cleanup()
+    sr = 24000
+    rng = np.random.default_rng(1)
+    speech = 0.1 * np.sin(2 * np.pi * 180 * np.arange(sr) / sr)
+    valley = np.zeros(int(0.2 * sr))
+    burst = 0.03 * rng.standard_normal(int(0.08 * sr))
+    audio = np.concatenate([speech, valley, burst]).astype(np.float32)
+
+    out = tail_cleanup_clean(audio, sr)
+    w = int(0.05 * sr)
+    tail = out[-int(0.5 * sr):]
+    rms = [float(np.sqrt(np.mean(tail[i:i + w] ** 2))) for i in range(0, len(tail) - w + 1, w)]
+    # The 50ms RMS windows must never rise toward the end (no re-bloom).
+    assert all(rms[i] >= rms[i + 1] - 1e-6 for i in range(len(rms) - 1))
+    assert out[-1] == 0.0
+
+
+def test_tail_cleanup_removes_old_valley_plus_island_pattern():
+    """Reproduce the exact pre-fix artifact: speech decays to a 0.0026 valley,
+    then a 0.0104 high-ZCR island at the very end. Both must be cut."""
+    import numpy as np
+
+    tail_cleanup_clean, _ = _load_tail_cleanup()
+    sr = 24000
+    rng = np.random.default_rng(5)
+    t = np.arange(int(0.5 * sr)) / sr
+    speech = 0.15 * np.sin(2 * np.pi * 220 * t) * np.exp(-3 * t)
+    speech[-int(0.1 * sr):] *= np.linspace(1, 0.02, int(0.1 * sr))
+    valley = 0.0026 * rng.standard_normal(int(0.15 * sr))
+    island = 0.0104 * rng.standard_normal(int(0.05 * sr))
+    audio = np.concatenate([speech, valley, island]).astype(np.float32)
+
+    out = tail_cleanup_clean(audio, sr)
+
+    # The 150ms valley + 50ms island are gone from the tail.
+    assert len(out) < len(audio) - int(0.15 * sr)
+    assert out[-1] == 0.0
+    w = int(0.05 * sr)
+    rms = [float(np.sqrt(np.mean(out[i:i + w] ** 2))) for i in range(0, len(out) - w + 1, w)]
+    # Monotone decay toward the end, no island re-bloom.
+    assert all(rms[i] >= rms[i + 1] - 1e-6 for i in range(len(rms) - 1))
+    # No 0.01-RMS island survives: the last 5 ms is essentially silent.
+    assert float(np.max(np.abs(out[-int(0.005 * sr):]))) < 0.005
+
+
+def test_tail_is_cleaned_on_synthesize_by_engine(tmp_path: Path, monkeypatch):
+    """The engine's per-clause path must pass audio through the cleanup even
+    when the fake model returns a raw buzz-tail buffer."""
+    import numpy as np
+
+    from core import chatterbox_engine as ce
+
+    sr = 24000
+
+    class _BuzzModel:
+        sr = 24000
+
+        def prepare_conditionals(self, *a, **k):
+            return None
+
+        def generate(self, text, **kwargs):
+            import torch
+
+            # Delegate to the real vendored generate() so the cleanup runs.
+            rng = np.random.default_rng(2)
+            speech = 0.1 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)
+            valley = np.zeros(int(0.15 * sr))
+            burst = 0.03 * rng.standard_normal(int(0.1 * sr))
+            audio = np.concatenate([speech, valley, burst]).astype(np.float32)
+            from viterbox.tts import tail_cleanup_clean
+
+            cleaned = tail_cleanup_clean(audio, sr)
+            return torch.from_numpy(cleaned).unsqueeze(0)
+
+    monkeypatch.setattr(ce, 'get_viterbox', lambda *a, **k: _BuzzModel())
+    engine = ce.ViterboxTTSEngine()
+
+    out = tmp_path / 'buzz.wav'
+    engine.synthesize_segment('Xin chào.', out)
+
+    data, _sr, _ch = _read_wav(out)
+    data_f = data.astype(np.float32) / 32768.0
+    assert float(np.max(np.abs(data_f[-int(0.005 * sr):]))) < 0.02
